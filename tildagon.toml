@@ -1,0 +1,12 @@
+[app]
+name = "Pin Tester"
+category = "Settings"
+
+[entry]
+class = "PinTesterApp"
+
+[metadata]
+author = "Corteil"
+license = "MIT"
+description = "Drive or read individual hexpansion port pins to check wiring continuity."
+version = "v1.0.0"
