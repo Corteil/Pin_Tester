@@ -129,6 +129,16 @@ Copy the contents of this repo onto the badge's `/apps/pin_tester/` directory, e
 `mpremote cp`, then reset the badge -- it'll show up as "Pin Tester" under Settings in the
 launcher menu.
 
+## Known limitations
+
+The hexpansion connector's dedicated `HEXP_DET` presence-detect line (pulled up on the badge,
+tied to GND by a real hexpansion PCB on insertion -- see the [Hexi-GFX
+README](https://github.com/Corteil/rp2350-hdmi-hexpansion)'s own pinout section) isn't
+testable here. It's not exposed via `system.hexpansion.config.HexpansionConfig` the way the
+HS/LS pins are -- presence detection appears to happen at a lower level (likely read directly
+off the AW9523B GPIO expander) and only surfaces to Python as
+`HexpansionInsertionEvent`/`HexpansionRemovalEvent`, not as a raw pin.
+
 ## Pin naming
 
 The primary name for every pin is its physical hexpansion label -- `HS_F`..`HS_I` and
