@@ -27,9 +27,12 @@ Per-pin modes:
   end of the wire can confirm continuity without needing precise button timing.
 
 Tiles (reached with LEFT/RIGHT, wrapping): **STATUS** (every pin's live value at once,
-colour-coded input/output), **PORT** (pick which hexpansion port, 1-6), **I2C** (scans the
-port's I2C bus for a real device, and reports whether the system has an EEPROM filesystem
-mounted there -- file count, and whether an app is available), then each pin in turn.
+colour-coded input/output), **PORT** (pick which hexpansion port, 1-6 -- also shows the
+identification EEPROM's friendly name and VID/PID if a real hexpansion is present, checking
+both the `0x50` and `0x57` EEPROM addresses since larger EEPROMs use the latter), **I2C**
+(scans the port's I2C bus for a real device, and reports whether the system has an EEPROM
+filesystem mounted there -- file count, and whether an app is available), then each pin in
+turn.
 
 ### Hexpansion safety
 

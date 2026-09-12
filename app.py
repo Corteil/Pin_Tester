@@ -78,6 +78,11 @@ from events.input import Buttons, BUTTON_TYPES
 from app_components.tokens import clear_background, small_font_size, label_font_size
 from system.hexpansion.config import HexpansionConfig
 try:
+    from system.hexpansion.util import read_hexpansion_header, detect_eeprom_addr
+except ImportError:
+    read_hexpansion_header = None
+    detect_eeprom_addr = None
+try:
     from events.joystick import JOYSTICK_BUTTON_TYPES
 except ImportError:
     JOYSTICK_BUTTON_TYPES = {}
@@ -128,6 +133,9 @@ class PinTesterApp(app.App):
         self.i2c_scan_error = None
         self.last_i2c_scan_ms = 0
         self.i2c_show_all = False
+        self.hexpansion_name = None
+        self.hexpansion_vid = None
+        self.hexpansion_pid = None
         self.last_hexpansion_present = False
         self.last_presence_check_ms = 0
         # Non-blocking remote command channel -- lets an external tool
@@ -176,6 +184,9 @@ class PinTesterApp(app.App):
         # hexpansion's identification EEPROM, if present) is the
         # equivalent check.
         self.last_i2c_scan_ms = time.ticks_ms()
+        self.hexpansion_name = None
+        self.hexpansion_vid = None
+        self.hexpansion_pid = None
         try:
             cfg = HexpansionConfig(self.port)
             self.i2c_scan_result = cfg.i2c.scan()
@@ -183,6 +194,27 @@ class PinTesterApp(app.App):
         except Exception as e:
             self.i2c_scan_result = None
             self.i2c_scan_error = "{!r}".format(e)
+            return
+
+        # If there's a real hexpansion identification EEPROM present, grab
+        # its friendly name/VID/PID too (system.hexpansion.util's own
+        # reader, the same one the badge's real hexpansion detection uses
+        # -- just called directly here rather than through the running
+        # HexpansionManagerApp instance). detect_eeprom_addr() first, since
+        # some (larger) EEPROMs live at 0x57 instead of the default 0x50 --
+        # assuming 0x50 always silently missed those (found testing against
+        # a real keyboard hexpansion).
+        if read_hexpansion_header is not None and detect_eeprom_addr is not None:
+            try:
+                addr, addr_len = detect_eeprom_addr(cfg.i2c)
+                if addr is not None:
+                    header = read_hexpansion_header(cfg.i2c, eeprom_addr=addr, addr_len=addr_len)
+                    if header is not None:
+                        self.hexpansion_name = header.friendly_name
+                        self.hexpansion_vid = header.vid
+                        self.hexpansion_pid = header.pid
+            except Exception:
+                pass
 
     def _check_eeprom(self):
         # Peeks at whatever the badge's own HexpansionManagerApp has
@@ -397,6 +429,13 @@ class PinTesterApp(app.App):
                 self._reset_all_pins()
                 self._scan_i2c()
                 self.i2c_show_all = False
+            else:
+                # Periodic refresh while sitting on this tile, so a
+                # hexpansion plugged in while you're looking shows up
+                # without needing to nudge the port.
+                now = time.ticks_ms()
+                if time.ticks_diff(now, self.last_i2c_scan_ms) >= 1000:
+                    self._scan_i2c()
         elif self.nav == NAV_I2C:
             if self.buttons.pressed(BUTTON_TYPES["UP"]) or self.buttons.pressed(BUTTON_TYPES["DOWN"]):
                 self.i2c_show_all = not self.i2c_show_all
@@ -559,8 +598,15 @@ class PinTesterApp(app.App):
 
         if self.nav == NAV_PORT:
             ctx.font_size = label_font_size
-            ctx.rgb(1, 1, 1).move_to(0, -20).text("PORT")
-            ctx.rgb(1, 0.8, 0).move_to(0, 15).text(str(self.port))
+            ctx.rgb(1, 1, 1).move_to(0, -55).text("PORT")
+            ctx.rgb(1, 0.8, 0).move_to(0, -20).text(str(self.port))
+            ctx.font_size = small_font_size
+            if self.hexpansion_name:
+                ctx.rgb(0, 0.9, 0).move_to(0, 10).text(self.hexpansion_name)
+                ctx.rgb(0.8, 0.8, 0.8).move_to(0, 30).text(
+                    "VID 0x{:04x}  PID 0x{:04x}".format(self.hexpansion_vid, self.hexpansion_pid))
+            else:
+                ctx.rgb(0.6, 0.6, 0.6).move_to(0, 10).text("no hexpansion ID")
         elif self.nav == NAV_I2C and self.i2c_show_all:
             # A completely separate, uncluttered layout for the full
             # address list -- U/D toggles here specifically when the
