@@ -53,7 +53,7 @@ Works on any badge/frontboard:
 | Button | Action |
 |---|---|
 | LEFT / RIGHT | Move between tiles: STATUS, PORT, I2C, then each pin |
-| UP / DOWN (on PORT tile) | Change the hexpansion port (1-6) -- resets every pin to INPUT, since it's a different physical connector |
+| UP / DOWN (on PORT or STATUS tile) | Change the hexpansion port (1-6) -- resets every pin to INPUT, since it's a different physical connector |
 | UP / DOWN (on I2C tile) | Toggle between the compact address list and a full-list view (when there are more addresses than fit compactly) |
 | CONFIRM (on STATUS tile) | Toggle "Remote: ON/OFF" (see below) |
 | CONFIRM (on a pin tile) | Switch that pin between its INPUT family (INPUT/LATCHED) and OUTPUT family (OFF/ON/AUTO) |

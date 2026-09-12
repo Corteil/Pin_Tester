@@ -409,6 +409,16 @@ class PinTesterApp(app.App):
         elif self.nav == NAV_STATUS:
             if self.buttons.pressed(BUTTON_TYPES["CONFIRM"]):
                 self.remote_active = not self.remote_active
+            elif self.buttons.pressed(BUTTON_TYPES["UP"]):
+                self.port = self.port % 6 + 1
+                self._reset_all_pins()
+                self._scan_i2c()
+                self.i2c_show_all = False
+            elif self.buttons.pressed(BUTTON_TYPES["DOWN"]):
+                self.port = (self.port - 2) % 6 + 1
+                self._reset_all_pins()
+                self._scan_i2c()
+                self.i2c_show_all = False
         else:
             i = self.nav
             if self.buttons.pressed(BUTTON_TYPES["CONFIRM"]):
