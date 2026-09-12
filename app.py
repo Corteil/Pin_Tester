@@ -67,6 +67,7 @@
 #   A           -- jump straight to the STATUS tile
 
 import app
+import os
 import sys
 import time
 try:
@@ -75,6 +76,7 @@ except ImportError:
     import select
 from events.input import Buttons, BUTTON_TYPES
 from app_components.tokens import clear_background, small_font_size, label_font_size
+from system.hexpansion.config import HexpansionConfig
 try:
     from events.joystick import JOYSTICK_BUTTON_TYPES
 except ImportError:
@@ -89,8 +91,9 @@ except ImportError:
     from pin_control import PIN_INFO, _resolve
 
 NUM_PINS = len(PIN_INFO)
-NAV_STATUS = -2
-NAV_PORT = -1
+NAV_STATUS = -3
+NAV_PORT = -2
+NAV_I2C = -1
 # pin tiles: 0 .. NUM_PINS-1
 
 PIN_MODE_INPUT = 0    # INPUT
@@ -121,6 +124,12 @@ class PinTesterApp(app.App):
         self.cancel_exit_triggered = False
         self.blink_state = False
         self.last_blink_ms = time.ticks_ms()
+        self.i2c_scan_result = None
+        self.i2c_scan_error = None
+        self.last_i2c_scan_ms = 0
+        self.i2c_show_all = False
+        self.last_hexpansion_present = False
+        self.last_presence_check_ms = 0
         # Non-blocking remote command channel -- lets an external tool
         # write plain text lines to this same USB serial port (raw, NOT
         # via mpremote's exec/cp, which always sends Ctrl-C first and would
@@ -136,6 +145,7 @@ class PinTesterApp(app.App):
         except Exception:
             self.remote_poll = None
         self._reset_all_pins()
+        self._scan_i2c()
 
     def _reset_all_pins(self):
         # Release anything currently touched back to INPUT before dropping
@@ -153,6 +163,86 @@ class PinTesterApp(app.App):
         self.latch_high = [False] * NUM_PINS
         self.latch_low = [False] * NUM_PINS
         self.live_levels = [None] * NUM_PINS
+        self.pin_auto_detected = [False] * NUM_PINS
+
+    def _scan_i2c(self):
+        # The hexpansion I2C bus isn't a per-port dedicated GPIO pair the
+        # way the HS/LS pins are -- it's a single shared physical bus
+        # (see tildagon/mpconfigboard.h's one fixed MICROPY_HW_I2C0_SDA/SCL)
+        # routed out to each port, most likely via an I2C GPIO expander
+        # (drivers/tildagon_pin/aw9523b.c) rather than distinct wires per
+        # port. So a raw GPIO toggle test (like the HS/LS pins get) isn't
+        # meaningful here -- an actual bus scan for a real device (the
+        # hexpansion's identification EEPROM, if present) is the
+        # equivalent check.
+        self.last_i2c_scan_ms = time.ticks_ms()
+        try:
+            cfg = HexpansionConfig(self.port)
+            self.i2c_scan_result = cfg.i2c.scan()
+            self.i2c_scan_error = None
+        except Exception as e:
+            self.i2c_scan_result = None
+            self.i2c_scan_error = "{!r}".format(e)
+
+    def _check_eeprom(self):
+        # Peeks at whatever the badge's own HexpansionManagerApp has
+        # already mounted for this port (system/hexpansion/app.py's
+        # _mount_eeprom uses this exact "/hexpansion_{port}" convention) --
+        # doesn't try to mount anything itself, just reports what the
+        # normal system hexpansion-detection already found, if anything.
+        mountpoint = "/hexpansion_{}".format(self.port)
+        try:
+            files = os.listdir(mountpoint)
+            has_app = "app.py" in files or "app.mpy" in files
+            return {"mounted": True, "count": len(files), "has_app": has_app}
+        except OSError:
+            return {"mounted": False, "count": 0, "has_app": False}
+
+    def _hexpansion_present(self):
+        # A real device answering on the I2C bus, or an already-mounted
+        # EEPROM filesystem, both indicate something is actually plugged
+        # into this port right now -- used to warn before driving OUTPUT
+        # onto pins a live device might also be driving.
+        if self.i2c_scan_result:
+            return True
+        return self._check_eeprom()["mounted"]
+
+    def _passive_probe_pin(self, pin, duration_ms=60, poll_ms=2):
+        # Purely passive: just watches the pin's own natural value over a
+        # short window, no pull resistor bias at all -- never risks even
+        # the mild "spurious edge on a sensitive far-end input" concern an
+        # active pull-up/down probe would. Flags "active" only if the pin
+        # is actually seen to toggle during the window (the same ever-
+        # high/ever-low idea LATCH mode already uses) -- a pin that just
+        # sits constant is left ambiguous, not assumed to be either type.
+        pin.init(pin.IN)
+        seen_high = False
+        seen_low = False
+        end = time.ticks_add(time.ticks_ms(), duration_ms)
+        while time.ticks_diff(end, time.ticks_ms()) > 0:
+            if pin.value():
+                seen_high = True
+            else:
+                seen_low = True
+            time.sleep_ms(poll_ms)
+        return seen_high and seen_low
+
+    def _auto_detect_pin_types(self):
+        # Runs once when a hexpansion is freshly detected on this port
+        # (see the presence-transition check in update()). Every pin
+        # always lands on INPUT regardless of the result -- passive
+        # monitoring only ever confirms activity, it's never grounds to
+        # pick OUTPUT for you. pin_auto_detected just drives the "auto"
+        # label shown on STATUS/pin tiles.
+        for i, (name, _secondary, _kind, _idx) in enumerate(PIN_INFO):
+            try:
+                pin = _resolve(self.port, name)
+                active = self._passive_probe_pin(pin)
+            except Exception:
+                active = False
+            self.pin_auto_detected[i] = active
+            self._apply_mode(i, PIN_MODE_INPUT)
+        self.status = "ready"
 
     def _apply_mode(self, i, mode):
         self.pin_modes[i] = mode
@@ -251,6 +341,21 @@ class PinTesterApp(app.App):
         if self.remote_active:
             self._poll_remote_commands()
 
+        # Hotplug: the moment a hexpansion is freshly detected on the
+        # current port (the system's own HexpansionManagerApp mounting its
+        # EEPROM -- checked directly here rather than via the possibly-
+        # stale i2c_scan_result, so this works regardless of which tile
+        # you're on), passively probe every pin once and land them all on
+        # INPUT. This briefly pauses the UI for ~9*60ms -- acceptable for
+        # a rare, one-shot event.
+        now = time.ticks_ms()
+        if time.ticks_diff(now, self.last_presence_check_ms) >= 500:
+            self.last_presence_check_ms = now
+            now_present = self._check_eeprom()["mounted"]
+            if now_present and not self.last_hexpansion_present:
+                self._auto_detect_pin_types()
+            self.last_hexpansion_present = now_present
+
         # CANCEL (physical F): short press resets the current pin's latch,
         # long press exits. Tracked manually since Buttons.pressed() is
         # edge-triggered and doesn't report hold duration on its own.
@@ -285,9 +390,22 @@ class PinTesterApp(app.App):
             if self.buttons.pressed(BUTTON_TYPES["UP"]):
                 self.port = self.port % 6 + 1
                 self._reset_all_pins()
+                self._scan_i2c()
+                self.i2c_show_all = False
             elif self.buttons.pressed(BUTTON_TYPES["DOWN"]):
                 self.port = (self.port - 2) % 6 + 1
                 self._reset_all_pins()
+                self._scan_i2c()
+                self.i2c_show_all = False
+        elif self.nav == NAV_I2C:
+            if self.buttons.pressed(BUTTON_TYPES["UP"]) or self.buttons.pressed(BUTTON_TYPES["DOWN"]):
+                self.i2c_show_all = not self.i2c_show_all
+            # Periodic re-scan while sitting on this tile, so a hexpansion
+            # plugged/unplugged while you're looking at it shows up
+            # without needing to nudge the port.
+            now = time.ticks_ms()
+            if time.ticks_diff(now, self.last_i2c_scan_ms) >= 1000:
+                self._scan_i2c()
         elif self.nav == NAV_STATUS:
             if self.buttons.pressed(BUTTON_TYPES["CONFIRM"]):
                 self.remote_active = not self.remote_active
@@ -364,7 +482,7 @@ class PinTesterApp(app.App):
         return True
 
     def _reset_current_latch(self):
-        if self.nav not in (NAV_PORT, NAV_STATUS):
+        if self.nav not in (NAV_STATUS, NAV_PORT, NAV_I2C):
             self.latch_high[self.nav] = False
             self.latch_low[self.nav] = False
 
@@ -409,12 +527,16 @@ class PinTesterApp(app.App):
             else:
                 level_text = "HIGH" if level else "LOW"
             colour = COLOR_OUTPUT if is_output else COLOR_INPUT
+            if self.pin_auto_detected[i]:
+                level_text += "*"  # auto-detected as actively driven on hexpansion insertion
             self._draw_status_value(ctx, x, y, "{}: ".format(name), level_text, level, colour)
         ctx.text_align = ctx.CENTER
 
     def _hint_text(self):
         if self.nav == NAV_PORT:
             return "U/D: port"
+        if self.nav == NAV_I2C:
+            return "U/D: back" if self.i2c_show_all else "U/D: show all"
         if self.nav == NAV_STATUS:
             return "C: remote"
         return "U/D:mode C:swap"
@@ -427,9 +549,48 @@ class PinTesterApp(app.App):
 
         if self.nav == NAV_PORT:
             ctx.font_size = label_font_size
-            ctx.rgb(1, 1, 1).move_to(0, -30).text("PORT")
-            ctx.font_size = label_font_size
-            ctx.rgb(1, 0.8, 0).move_to(0, 5).text(str(self.port))
+            ctx.rgb(1, 1, 1).move_to(0, -20).text("PORT")
+            ctx.rgb(1, 0.8, 0).move_to(0, 15).text(str(self.port))
+        elif self.nav == NAV_I2C and self.i2c_show_all:
+            # A completely separate, uncluttered layout for the full
+            # address list -- U/D toggles here specifically when the
+            # compact view's addresses overflowed, rather than squeezing
+            # everything onto the same crowded tile.
+            ctx.font_size = small_font_size
+            ctx.rgb(1, 1, 1).move_to(0, -85).text("Port {}  I2C -- all".format(self.port))
+            addr_strs = ["0x{:02x}".format(a) for a in (self.i2c_scan_result or [])]
+            groups = [addr_strs[i:i + 3] for i in range(0, len(addr_strs), 3)][:6]
+            row_y = -55
+            for group in groups:
+                ctx.rgb(0, 0.9, 0).move_to(0, row_y).text(", ".join(group))
+                row_y += 16
+        elif self.nav == NAV_I2C:
+            # Port label pinned to the very top (matching STATUS's title
+            # position) to leave the middle of the screen free for however
+            # many I2C addresses turn up.
+            ctx.font_size = small_font_size
+            ctx.rgb(1, 1, 1).move_to(0, -88).text("Port {}  I2C".format(self.port))
+
+            if self.i2c_scan_error is not None:
+                ctx.rgb(1, 0.4, 0.4).move_to(0, -40).text("scan error")
+            elif not self.i2c_scan_result:
+                ctx.rgb(0.6, 0.6, 0.6).move_to(0, -40).text("no device found")
+            else:
+                addr_strs = ["0x{:02x}".format(a) for a in self.i2c_scan_result]
+                shown = ", ".join(addr_strs[:3])
+                if len(addr_strs) > 3:
+                    shown += "..."
+                ctx.rgb(0, 0.9, 0).move_to(0, -40).text(shown)
+
+            eeprom = self._check_eeprom()
+            if eeprom["mounted"]:
+                ctx.rgb(0, 0.9, 0).move_to(0, 10).text("EEPROM: mounted")
+                ctx.rgb(0.8, 0.8, 0.8).move_to(0, 30).text("files: {}".format(eeprom["count"]))
+                app_colour = (0, 0.9, 0) if eeprom["has_app"] else (1, 0.4, 0.4)
+                app_text = "yes" if eeprom["has_app"] else "no"
+                ctx.rgb(*app_colour).move_to(0, 50).text("app available: {}".format(app_text))
+            else:
+                ctx.rgb(0.6, 0.6, 0.6).move_to(0, 10).text("EEPROM: not mounted")
         elif self.nav == NAV_STATUS:
             ctx.font_size = label_font_size
             ctx.rgb(1, 1, 1).move_to(0, -88).text("Pin Tester")
@@ -448,7 +609,12 @@ class PinTesterApp(app.App):
             title = "{} ({})".format(name, secondary) if secondary else name
             ctx.font_size = small_font_size
             ctx.rgb(*colour).move_to(0, -55).text("Port {}  {}".format(self.port, title))
-            ctx.rgb(1, 0.6, 1).move_to(0, -32).text(PIN_MODE_LABELS[mode])
+            if self._hexpansion_present():
+                ctx.rgb(1, 0.7, 0).move_to(0, -42).text("⚠ hexpansion present")
+            mode_text = PIN_MODE_LABELS[mode]
+            if self.pin_auto_detected[i]:
+                mode_text += " (auto)"
+            ctx.rgb(1, 0.6, 1).move_to(0, -22).text(mode_text)
 
             level = self.live_levels[i]
             hilo_text = "?" if level is None else ("HIGH" if level else "LOW")

@@ -27,7 +27,24 @@ Per-pin modes:
   end of the wire can confirm continuity without needing precise button timing.
 
 Tiles (reached with LEFT/RIGHT, wrapping): **STATUS** (every pin's live value at once,
-colour-coded input/output), **PORT** (pick which hexpansion port, 1-6), then each pin in turn.
+colour-coded input/output), **PORT** (pick which hexpansion port, 1-6), **I2C** (scans the
+port's I2C bus for a real device, and reports whether the system has an EEPROM filesystem
+mounted there -- file count, and whether an app is available), then each pin in turn.
+
+### Hexpansion safety
+
+If a real hexpansion is detected present on the current port (an I2C device answers, or its
+EEPROM filesystem is mounted), pin tiles show a "⚠ hexpansion present" warning -- OUTPUT
+modes are still fully usable, this is informational only, so you don't accidentally drive a
+pin a live device is also driving.
+
+The moment a hexpansion is freshly detected on a port, every pin is passively probed once (a
+brief ~0.5s pause): each pin is watched at its own natural, unbiased level for a short window,
+and flagged "active" if it's ever seen to toggle during that window (no pull resistor bias is
+applied, so this can't itself perturb anything on the far end). Every pin lands on INPUT
+regardless of the result -- the probe only ever confirms activity, never a reason to choose
+OUTPUT for you. Pins found active are marked "(auto)" on their own tile and with a trailing
+`*` on the STATUS grid.
 
 ## Controls
 
@@ -35,8 +52,9 @@ Works on any badge/frontboard:
 
 | Button | Action |
 |---|---|
-| LEFT / RIGHT | Move between tiles: STATUS, PORT, then each pin |
+| LEFT / RIGHT | Move between tiles: STATUS, PORT, I2C, then each pin |
 | UP / DOWN (on PORT tile) | Change the hexpansion port (1-6) -- resets every pin to INPUT, since it's a different physical connector |
+| UP / DOWN (on I2C tile) | Toggle between the compact address list and a full-list view (when there are more addresses than fit compactly) |
 | CONFIRM (on STATUS tile) | Toggle "Remote: ON/OFF" (see below) |
 | CONFIRM (on a pin tile) | Switch that pin between its INPUT family (INPUT/LATCHED) and OUTPUT family (OFF/ON/AUTO) |
 | UP / DOWN (on a pin tile) | Within INPUT family: toggle INPUT <-> LATCHED. Within OUTPUT family: cycle OFF -> ON -> AUTO |
