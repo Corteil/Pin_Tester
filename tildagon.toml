@@ -1,12 +1,27 @@
 [app]
+# The name of your app as displayed in the menu
 name = "Pin Tester"
-category = "Settings"
+
+# The submenu where your app should appear.
+# One of: "Badge", "Music", "Media", "Apps", "Games"
+category = "Apps"
 
 [entry]
+# The name of your entry point `Application` class
 class = "PinTesterApp"
 
 [metadata]
+# Your nickname.  Must be at most 32 characters!
 author = "Corteil"
+
+# License of your app as an SPDX identifier: <https://spdx.org/licenses/>
 license = "MIT"
+
+# URL to the repository of your app.
+url = "https://github.com/Corteil/Pin_Tester"
+
+# Description of your app.  Maximum 140 characters!
 description = "Drive or read individual hexpansion port pins to check wiring continuity."
-version = "v1.0.0"
+
+# Version number of your app.  Must be an integer!
+version = "1"

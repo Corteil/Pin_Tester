@@ -1,7 +1,7 @@
 {
     "name": "Pin Tester",
-    "category": "Settings",
+    "category": "Apps",
     "author": "Corteil",
     "description": "Drive or read individual hexpansion port pins to check wiring continuity.",
-    "version": "1.0.0"
+    "version": "1"
 }
