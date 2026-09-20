@@ -91,8 +91,15 @@ try:
 except ImportError:
     KEYBOARD_BUTTONS = {}
 try:
-    from apps.pin_tester.pin_control import PIN_INFO, _resolve
+    # Relative import: correct regardless of what folder this app is
+    # installed under (sideloading uses "pin_tester", but the app store
+    # installs to "<owner>_<repo>", e.g. "Corteil_Pin_Tester" -- a
+    # hardcoded absolute path here broke store installs).
+    from .pin_control import PIN_INFO, _resolve
 except ImportError:
+    # Falls back to a bare import for standalone script execution (no
+    # package context), e.g. testing app.py directly rather than through
+    # the launcher.
     from pin_control import PIN_INFO, _resolve
 
 NUM_PINS = len(PIN_INFO)

@@ -24,4 +24,4 @@ url = "https://github.com/Corteil/Pin_Tester"
 description = "Drive or read individual hexpansion port pins to check wiring continuity."
 
 # Version number of your app.  Must be an integer!
-version = "1"
+version = "2"
