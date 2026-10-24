@@ -6,6 +6,11 @@ project](https://github.com/Corteil/rp2350-hdmi-hexpansion) after needing a way 
 that a given hexpansion port's wires actually reach the far end, without any protocol-level
 assumptions getting in the way.
 
+**Companion app:** [Pin Tester Companion](https://github.com/Corteil/Pin_Tester_Companion) is a
+desktop GUI and command-line tool for this app -- plug the badge into a computer over USB and
+drive, inspect and probe the pins from there (live levels, PWM / LED / analog controls, the
+hexpansion's EEPROM and I2C details). It uses the remote protocol described below.
+
 ## What it does
 
 Covers all 9 pins a hexpansion port exposes: the 4 high-speed ones (`HS_F`, `HS_G`, `HS_H`,
@@ -113,6 +118,10 @@ button-event level), so no extra setup is needed there.
 ## Driving it from a computer
 
 Two ways, depending on whether the app needs to keep running live on screen or not.
+
+For live control the easiest route is the
+[Pin Tester Companion](https://github.com/Corteil/Pin_Tester_Companion) (GUI and command line); it
+speaks the protocol below and needs this app at version 4 or newer.
 
 ### One-shot, app doesn't need to be running
 
