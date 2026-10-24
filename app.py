@@ -18,19 +18,21 @@
 # exec/cp (which always sends Ctrl-C first and would kill this app) --
 # e.g. from a shell: `stty -F /dev/ttyACM0 raw -echo && printf 'GET HS_F\n'
 # > /dev/ttyACM0`, with a separate `cat /dev/ttyACM0` (or similar) reading
-# the response back. Commands, one per line:
-#   STATUS                          -- every pin's name=level
-#   INSPECT [<pin>]                 -- fresh read-only snapshot of how the
-#                                      pin(s) are currently configured
-#   GET <pin>                       -- one pin's current level
-#   SET <pin> IN|LATCH|OFF|ON|AUTO      -- change a pin's mode
-#   SET <pin> INSPECT                   -- hands off again (releases the pin
-#                                          to INPUT, then read-only)
-#   SET <pin> PWM [hz [duty]]           -- HS pins only: hardware PWM
-#   SET <pin> LEDOFF|LEDON|BREATHE [n]  -- LED modes, LS_A..LS_E only; n is
-#                                          brightness 0-100 (LEDON) or
-#                                          cycle time in 0.1s units, 2-100
-#                                          (BREATHE)
+# the response back (or use the companion app, which does all of this).
+# Commands, one per line (full list with details in _handle_remote_command):
+#   PING                            -- PONG proto=N
+#   STATUS / GET <pin>              -- live levels
+#   DUMP                            -- full port state, ends in END
+#   PORTINFO [SCAN]                 -- EEPROM / I2C details, ends in END
+#   INSPECT [<pin>]                 -- read-only snapshot, ends in END
+#   PORT [n]                        -- show / change the hexpansion port
+#   RESET                           -- hand every pin back
+#   SET <pin> IN|LATCH|OFF|ON|AUTO|INSPECT
+#   SET <pin> PWM [hz [duty]]       -- HS pins only
+#   SET <pin> ANALOG                -- HS pins on ports 4-6 only: read volts
+#   SET <pin> LEDOFF|LEDON [pct]    -- LS pins only (brightness)
+#   SET <pin> BREATHE [n [pct]]     -- LS pins only (cycle time n x 0.1s,
+#                                      peak brightness pct)
 # This only has any effect while "Remote: ON" is showing on the STATUS
 # tile -- otherwise incoming commands are ignored entirely, so pins can
 # never change remotely by surprise.
@@ -84,6 +86,10 @@
 #     INSPECT -> INPUT -> OUTPUT -> LED -> INSPECT, and F (short press) cycles
 #     LED OFF -> LED ON -> BREATHE. In the LED modes UP/DOWN auto-repeats
 #     while held (after a short delay, faster the longer it's held).
+#   HS pins on ports 4-6 also have ANALOG IN (reads the voltage with the
+#   ESP32-S3 ADC, ~0-3.1V; ports 1-3 have no ADC pins) as the step after PWM
+#   in the CONFIRM cycle. Reading analog reconfigures the pin, so unlike
+#   INSPECT ONLY don't use it on a pin a hexpansion is driving.
 #   HS pins have a third family too, PWM (real ESP32 hardware PWM, 10Hz to
 #   100kHz): CONFIRM cycles ... -> OUTPUT -> PWM -> INSPECT, F (short
 #   press) switches between editing frequency and duty, and UP/DOWN
@@ -122,6 +128,10 @@ try:
     from machine import PWM
 except ImportError:
     PWM = None
+try:
+    from machine import ADC
+except ImportError:
+    ADC = None
 from events.input import Buttons, BUTTON_TYPES
 from app_components.tokens import clear_background, small_font_size, label_font_size
 from system.hexpansion.config import HexpansionConfig
@@ -154,12 +164,12 @@ try:
     # installed under (sideloading uses "pin_tester", but the app store
     # installs to "<owner>_<repo>", e.g. "Corteil_Pin_Tester" -- a
     # hardcoded absolute path here broke store installs).
-    from .pin_control import PIN_INFO, _resolve, inspect_pins
+    from .pin_control import PIN_INFO, _resolve, inspect_pins, adc_channel
 except ImportError:
     # Falls back to a bare import for standalone script execution (no
     # package context), e.g. testing app.py directly rather than through
     # the launcher.
-    from pin_control import PIN_INFO, _resolve, inspect_pins
+    from pin_control import PIN_INFO, _resolve, inspect_pins, adc_channel
 
 NUM_PINS = len(PIN_INFO)
 NAV_STATUS = -3
@@ -177,8 +187,25 @@ PIN_MODE_LED_ON = 6
 PIN_MODE_LED_BREATHE = 7
 PIN_MODE_PWM = 8      # HS pins only: ESP32 hardware PWM
 PIN_MODE_INSPECT = 9  # read-only: show how the pin is already set, never touch it
+PIN_MODE_ANALOG = 10  # HS pins on ports 4-6 only: read the voltage with the ADC
 PIN_MODE_LABELS = ("INPUT", "LATCHED", "OUTPUT: OFF", "OUTPUT: ON", "OUTPUT: AUTO",
-                   "LED: OFF", "LED: ON", "LED: BREATHE", "PWM", "INSPECT ONLY")
+                   "LED: OFF", "LED: ON", "LED: BREATHE", "PWM", "INSPECT ONLY", "ANALOG IN")
+# Remote-protocol names for each mode (SET <pin> <word>, and DUMP's mode=).
+MODE_WORDS = {
+    "IN": PIN_MODE_INPUT,
+    "LATCH": PIN_MODE_LATCH,
+    "OFF": PIN_MODE_OUTPUT_OFF,
+    "ON": PIN_MODE_OUTPUT_ON,
+    "AUTO": PIN_MODE_OUTPUT_AUTO,
+    "LEDOFF": PIN_MODE_LED_OFF,
+    "LEDON": PIN_MODE_LED_ON,
+    "BREATHE": PIN_MODE_LED_BREATHE,
+    "PWM": PIN_MODE_PWM,
+    "INSPECT": PIN_MODE_INSPECT,
+    "ANALOG": PIN_MODE_ANALOG,
+}
+MODE_WORD_BY_MODE = {mode: word for word, mode in MODE_WORDS.items()}
+REMOTE_PROTOCOL = 2
 INPUT_FAMILY = (PIN_MODE_INPUT, PIN_MODE_LATCH)
 OUTPUT_FAMILY = (PIN_MODE_OUTPUT_OFF, PIN_MODE_OUTPUT_ON, PIN_MODE_OUTPUT_AUTO)
 LED_FAMILY = (PIN_MODE_LED_OFF, PIN_MODE_LED_ON, PIN_MODE_LED_BREATHE)
@@ -187,6 +214,7 @@ COLOR_INPUT = (0, 1, 1)      # cyan
 COLOR_OUTPUT = (1, 0.55, 0)  # orange
 COLOR_LED = (1, 1, 0.3)      # yellow
 COLOR_INSPECT = (0.75, 0.75, 0.75)  # grey
+COLOR_ANALOG = (0.55, 0.85, 1.0)    # light blue
 COLOR_WARN = (1, 0.7, 0)     # hexpansion-present warning, INSPECT ONLY label
 
 BLINK_PERIOD_MS = 250  # ~2Hz full cycle
@@ -201,6 +229,9 @@ PWM_FIELD_FREQ = 0
 PWM_FIELD_DUTY = 1
 # Hold-to-repeat for UP/DOWN in the LED modes.
 RESET_CONFIRM_MS = 3000  # window for the second F press that confirms a pin reset
+ANALOG_POLL_MS = 100     # how often ANALOG pins are sampled
+ANALOG_SAMPLES = 4       # readings averaged per sample
+ANALOG_FULL_MV = 3100    # the ADC's usable range at the attenuation used (~0-3.1V)
 INSPECT_POLL_MS = 250  # how often read-only pin snapshots refresh
 GRID_FONT_SCALE = 0.85  # STATUS tile pin grid text is drawn smaller than normal text
 VALUE_LINES_TOP = -6    # pin tile: first value line, near the display's middle
@@ -208,6 +239,7 @@ VALUE_LINE_STEP = 20
 DISPLAY_RADIUS = 120    # round 240px display
 DISPLAY_MARGIN = 6      # keep text this far inside the edge
 HINT_FONT_SCALE = 0.8  # bottom hint lines are drawn smaller than normal text
+I2C_ROWS_MAX = 6   # rows of 3 addresses on the I2C "show all" view (18 addresses)
 NAV_JUMP_DELAY_MS = 500   # hold LEFT/RIGHT this long to jump a whole section
 NAV_JUMP_REPEAT_MS = 700  # ...then keep jumping this often while still held
 HOLD_DELAY_MS = 400    # held this long before repeating starts
@@ -244,6 +276,7 @@ class PinTesterApp(app.App):
         self.blink_state = False
         self.last_blink_ms = time.ticks_ms()
         self.last_inspect_ms = 0
+        self.last_analog_ms = 0
         self.i2c_scan_result = None
         self.i2c_scan_error = None
         self.last_i2c_scan_ms = 0
@@ -306,6 +339,9 @@ class PinTesterApp(app.App):
         self.pwm_freq_idx = [PWM_DEFAULT_FREQ_IDX] * NUM_PINS
         self.pwm_duty = [PWM_DEFAULT_DUTY] * NUM_PINS
         self.pwm_field = [PWM_FIELD_FREQ] * NUM_PINS
+        self.adc_objs = [None] * NUM_PINS
+        self.adc_mv = [None] * NUM_PINS
+        self.adc_raw = [None] * NUM_PINS
 
     def _scan_i2c(self):
         # The hexpansion I2C bus isn't a per-port dedicated GPIO pair the
@@ -321,6 +357,7 @@ class PinTesterApp(app.App):
         self.hexpansion_name = None
         self.hexpansion_vid = None
         self.hexpansion_pid = None
+        self.hexpansion_extra = None  # rest of the EEPROM header, for PORTINFO
         try:
             cfg = HexpansionConfig(self.port)
             self.i2c_scan_result = cfg.i2c.scan()
@@ -347,6 +384,13 @@ class PinTesterApp(app.App):
                         self.hexpansion_name = header.friendly_name
                         self.hexpansion_vid = header.vid
                         self.hexpansion_pid = header.pid
+                        self.hexpansion_extra = {
+                            "addr": addr,
+                            "uid": header.unique_id,
+                            "size": header.eeprom_total_size,
+                            "page": header.eeprom_page_size,
+                            "ver": str(header.manifest_version).strip(),
+                        }
             except Exception:
                 pass
 
@@ -437,6 +481,9 @@ class PinTesterApp(app.App):
         if user is not None:
             self.pin_user_set[i] = user
         self._pwm_stop(i)  # release any running PWM before reconfiguring
+        self.adc_objs[i] = None
+        self.adc_mv[i] = None
+        self.adc_raw[i] = None
         self.pin_modes[i] = mode
         self.latch_high[i] = False
         self.latch_low[i] = False
@@ -472,6 +519,12 @@ class PinTesterApp(app.App):
                     pin, freq=PWM_FREQS[self.pwm_freq_idx[i]],
                     duty_u16=self.pwm_duty[i] * 65535 // 100)
                 self.live_levels[i] = self.pwm_duty[i]
+            elif mode == PIN_MODE_ANALOG:
+                if ADC is None or not self._adc_capable(i):
+                    raise ValueError("no ADC on this pin (HS pins on ports 4-6 only)")
+                atten = getattr(ADC, "ATTN_12DB", None) or ADC.ATTN_11DB  # ~0-3.1V
+                self.adc_objs[i] = ADC(pin, atten=atten)
+                self.live_levels[i] = None
             elif mode in LED_FAMILY:
                 if PIN_INFO[i][2] != "ls":
                     raise ValueError("LED mode is LS pins only")
@@ -530,6 +583,27 @@ class PinTesterApp(app.App):
         for i in range(NUM_PINS):
             if not self.pin_user_set[i] and self.pin_modes[i] != target:
                 self._apply_mode(i, target, user=False)
+
+    def _adc_capable(self, i):
+        # True for HS pins whose GPIO has an ESP32-S3 ADC channel (ports 4-6).
+        return PIN_INFO[i][2] == "hs" and adc_channel(self.port, PIN_INFO[i][0]) is not None
+
+    def _read_analog(self, i):
+        adc = self.adc_objs[i]
+        if adc is None:
+            return
+        try:
+            uv = 0
+            for _ in range(ANALOG_SAMPLES):
+                uv += adc.read_uv()
+            self.adc_mv[i] = uv // ANALOG_SAMPLES // 1000
+            self.adc_raw[i] = adc.read_u16()
+            self.live_levels[i] = self.adc_mv[i]
+        except Exception as e:
+            # e.g. ADC2 while the radio is busy
+            self.adc_mv[i] = None
+            self.live_levels[i] = None
+            self.status = "adc error: {!r}".format(e)
 
     def _poll_inspect(self, now):
         # Read-only snapshot of every hands-off pin (see
@@ -655,6 +729,10 @@ class PinTesterApp(app.App):
             self.pwm_freq_idx[i] = max(0, min(len(PWM_FREQS) - 1, self.pwm_freq_idx[i] + direction))
         else:
             self.pwm_duty[i] = max(0, min(100, self.pwm_duty[i] + direction))
+        self._pwm_push(i)
+
+    def _pwm_push(self, i):
+        # Push pin i's stored frequency/duty into its running PWM.
         try:
             self.pwm_objs[i].freq(PWM_FREQS[self.pwm_freq_idx[i]])
             self.pwm_objs[i].duty_u16(self.pwm_duty[i] * 65535 // 100)
@@ -701,31 +779,130 @@ class PinTesterApp(app.App):
         if line:
             self._handle_remote_command(line)
 
+    def _remote_dump(self):
+        # Full machine-readable state, for the companion app:
+        #   DUMP port=1 present=1 detect=1
+        #   PIN LS_A mode=LEDON level=127 out=50 bright=50 period=2000 user=1
+        #   ...
+        #   END
+        # mode= uses the SET words; level is the live level (0/1 for
+        # digital pins, duty for LED pins, duty percent for PWM, "-" when
+        # unknown). Extra key=value fields depend on the mode.
+        detect = "-" if self.detect_line is None else int(self.detect_line)
+        print("DUMP port={} present={} detect={} proto={}".format(
+            self.port, int(bool(self.port_present)), detect, REMOTE_PROTOCOL))
+        for i, (name, _s, kind, _x) in enumerate(PIN_INFO):
+            mode = self.pin_modes[i]
+            level = self.live_levels[i]
+            fields = ["mode=" + MODE_WORD_BY_MODE[mode],
+                      "level=" + ("-" if level is None else str(level)),
+                      "kind=" + kind,
+                      "user={}".format(int(self.pin_user_set[i])),
+                      "auto={}".format(int(self.pin_auto_detected[i]))]
+            chan = adc_channel(self.port, name) if kind == "hs" else None
+            if chan is not None:
+                fields.append("adc=ADC{}_CH{}".format(chan[0], chan[1]))
+            if mode == PIN_MODE_INSPECT:
+                info = self.inspect_info[i]
+                if info is not None:
+                    for k in ("func", "dir", "pull", "sel"):
+                        if k in info:
+                            fields.append("{}={}".format(k, info[k]))
+            elif mode == PIN_MODE_LATCH:
+                fields.append("hi={}".format(int(self.latch_high[i])))
+                fields.append("lo={}".format(int(self.latch_low[i])))
+            elif mode in LED_FAMILY:
+                fields.append("bright={}".format(self.led_level[i]))
+                fields.append("period={}".format(self.led_period[i]))
+                if level is not None:
+                    fields.append("out={}".format(self._pct_from_duty(level)))
+            elif mode == PIN_MODE_PWM:
+                fields.append("freq={}".format(PWM_FREQS[self.pwm_freq_idx[i]]))
+                fields.append("duty={}".format(self.pwm_duty[i]))
+            elif mode == PIN_MODE_ANALOG:
+                if self.adc_mv[i] is not None:
+                    fields.append("mv={}".format(self.adc_mv[i]))
+                    fields.append("raw={}".format(self.adc_raw[i]))
+            print("PIN {} {}".format(name, " ".join(fields)))
+        print("END")
+
+    def _remote_portinfo(self, scan):
+        # EEPROM / I2C details for the current port, for the companion app:
+        #   PORTINFO port=1 present=1 detect=1 eeprom=1 files=3 app=1 scan=ok
+        #            addr=80 vid=.. pid=.. uid=.. size=.. page=.. ver=..
+        #   NAME <friendly name>          (if the EEPROM header has one)
+        #   I2C 80 87                     (decimal addresses that answered)
+        #   SCANERR <text>                (if the bus scan failed)
+        #   END
+        # scan=1 does a fresh I2C bus scan first (it probes every address
+        # on the port's bus, so it's only done when asked); otherwise the
+        # last scan's result is reported.
+        if scan:
+            self._scan_i2c()
+        self._refresh_presence()
+        eeprom = self._check_eeprom()
+        detect = "-" if self.detect_line is None else int(self.detect_line)
+        if self.i2c_scan_error:
+            scan_state = "err"
+        elif self.i2c_scan_result is None:
+            scan_state = "-"
+        else:
+            scan_state = "ok"
+        fields = ["port={}".format(self.port), "present={}".format(int(bool(self.port_present))),
+                  "detect={}".format(detect), "eeprom={}".format(int(eeprom["mounted"])),
+                  "files={}".format(eeprom["count"]), "app={}".format(int(eeprom["has_app"])),
+                  "scan=" + scan_state]
+        extra = self.hexpansion_extra
+        if extra:
+            for key in ("addr", "uid", "size", "page", "ver"):
+                fields.append("{}={}".format(key, extra[key]))
+        if self.hexpansion_vid is not None:
+            fields.append("vid={}".format(self.hexpansion_vid))
+            fields.append("pid={}".format(self.hexpansion_pid))
+        print("PORTINFO " + " ".join(fields))
+        if self.hexpansion_name:
+            print("NAME " + str(self.hexpansion_name).strip())
+        if self.i2c_scan_result:
+            print("I2C " + " ".join(str(a) for a in self.i2c_scan_result))
+        if self.i2c_scan_error:
+            print("SCANERR " + self.i2c_scan_error)
+        print("END")
+
+    def _remote_set_port(self, n):
+        self.port = n
+        self._reset_all_pins()
+        self._scan_i2c()
+        self.i2c_show_all = False
+        self._refresh_presence()
+        self._sync_default_modes()
+
     def _handle_remote_command(self, line):
         # Plain-text remote protocol, one command per line, no Ctrl-C
-        # involved at all (see remote_poll's own setup comment):
-        #   STATUS                 -- print every pin's name=level
-        #   GET <pin>               -- print one pin's current level
-        #   SET <pin> IN|LATCH|OFF|ON|AUTO|LEDOFF|LEDON|BREATHE [n]
-        #                           -- change a pin's mode (see module docstring)
-        MODE_WORDS = {
-            "IN": PIN_MODE_INPUT,
-            "LATCH": PIN_MODE_LATCH,
-            "OFF": PIN_MODE_OUTPUT_OFF,
-            "ON": PIN_MODE_OUTPUT_ON,
-            "AUTO": PIN_MODE_OUTPUT_AUTO,
-            "LEDOFF": PIN_MODE_LED_OFF,
-            "LEDON": PIN_MODE_LED_ON,
-            "BREATHE": PIN_MODE_LED_BREATHE,
-            "PWM": PIN_MODE_PWM,
-            "INSPECT": PIN_MODE_INSPECT,
-        }
+        # involved at all (see remote_poll's own setup comment). Responses
+        # are single lines, except the multi-line ones that end in END:
+        #   PING                    -- PONG proto=N (checks "Remote: ON")
+        #   STATUS                  -- every pin's name=level
+        #   GET <pin>               -- one pin's current level
+        #   DUMP                    -- full state of the port, ends in END
+        #   PORTINFO [SCAN]         -- hexpansion EEPROM / I2C details, ends in END
+        #   INSPECT [<pin>]         -- fresh read-only snapshot, ends in END
+        #   PORT [n]                -- show / change the hexpansion port
+        #   RESET                   -- hand every pin back (like STATUS F)
+        #   SET <pin> IN|LATCH|OFF|ON|AUTO|INSPECT
+        #   SET <pin> PWM [hz [duty]]               (HS pins)
+        #   SET <pin> ANALOG                        (HS pins on ports 4-6, ADC)
+        #   SET <pin> LEDOFF|LEDON [pct]            (LS pins, brightness)
+        #   SET <pin> BREATHE [n [pct]]             (LS pins, n x 0.1s, peak %)
+        # Re-sending SET for a mode the pin is already in just updates its
+        # values in place (no reconfiguring), so sliders stay smooth.
         parts = line.split()
         if not parts:
             return
         cmd = parts[0].upper()
         try:
-            if cmd == "STATUS":
+            if cmd == "PING":
+                print("PONG proto={}".format(REMOTE_PROTOCOL))
+            elif cmd == "STATUS":
                 fields = ["{}={}".format(name, self.live_levels[i])
                           for i, (name, _s, _k, _idx) in enumerate(PIN_INFO)]
                 print("STATUS " + " ".join(fields))
@@ -735,6 +912,26 @@ class PinTesterApp(app.App):
                     print("ERR unknown pin {}".format(parts[1]))
                 else:
                     print("GET {} {}".format(parts[1], self.live_levels[i]))
+            elif cmd == "DUMP":
+                self._remote_dump()
+            elif cmd == "PORTINFO":
+                self._remote_portinfo(len(parts) >= 2 and parts[1].upper() == "SCAN")
+            elif cmd == "PORT":
+                if len(parts) >= 2:
+                    n = int(parts[1])
+                    if 1 <= n <= 6:
+                        self._remote_set_port(n)
+                        print("OK PORT {}".format(n))
+                    else:
+                        print("ERR port must be 1-6")
+                else:
+                    print("PORT {}".format(self.port))
+            elif cmd == "RESET":
+                self._reset_all_pins()
+                self.status = "ready"
+                self._refresh_presence()
+                self._sync_default_modes()
+                print("OK RESET")
             elif cmd == "INSPECT":
                 # Fresh read-only snapshot, e.g. "INSPECT" or "INSPECT HS_F".
                 names = [parts[1]] if len(parts) >= 2 else None
@@ -742,6 +939,7 @@ class PinTesterApp(app.App):
                     fields = ["{}={}".format(k, info[k])
                               for k in ("func", "dir", "level", "pull") if k in info]
                     print("INSPECT {} {}".format(name, " ".join(fields)))
+                print("END")
             elif cmd == "SET" and len(parts) >= 3:
                 i = self._pin_index_by_name(parts[1])
                 mode_word = parts[2].upper()
@@ -753,10 +951,13 @@ class PinTesterApp(app.App):
                     print("ERR LED mode is LS pins only")
                 elif mode_word == "PWM" and PIN_INFO[i][2] != "hs":
                     print("ERR PWM mode is HS pins only")
+                elif mode_word == "ANALOG" and not self._adc_capable(i):
+                    print("ERR ANALOG needs an HS pin on port 4, 5 or 6")
                 else:
+                    target = MODE_WORDS[mode_word]
                     if len(parts) >= 4:
                         n = int(parts[3])
-                        if mode_word == "LEDON":
+                        if mode_word in ("LEDON", "LEDOFF"):
                             self.led_level[i] = max(0, min(100, n))
                         elif mode_word == "PWM":
                             # n = frequency in Hz (snapped to the nearest
@@ -768,7 +969,15 @@ class PinTesterApp(app.App):
                         elif mode_word == "BREATHE":
                             self.led_period[i] = max(LED_PERIOD_MIN_MS, min(
                                 LED_PERIOD_MAX_MS, n * 100))
-                    self._apply_mode(i, MODE_WORDS[mode_word])
+                            if len(parts) >= 5:
+                                self.led_level[i] = max(0, min(100, int(parts[4])))
+                    if self.pin_modes[i] == target and target == PIN_MODE_PWM:
+                        self.pin_user_set[i] = True
+                        self._pwm_push(i)  # already running: update in place
+                    elif self.pin_modes[i] == target and target in LED_FAMILY:
+                        self.pin_user_set[i] = True  # values are read live
+                    else:
+                        self._apply_mode(i, target)
                     print("OK {} {}".format(parts[1], mode_word))
             else:
                 print("ERR bad command: {}".format(line))
@@ -911,11 +1120,13 @@ class PinTesterApp(app.App):
                     self._apply_mode(i, PIN_MODE_OUTPUT_OFF)
                 elif self.pin_modes[i] in OUTPUT_FAMILY:
                     self._apply_mode(i, PIN_MODE_LED_OFF if PIN_INFO[i][2] == "ls" else PIN_MODE_PWM)
+                elif self.pin_modes[i] == PIN_MODE_PWM and self._adc_capable(i):
+                    self._apply_mode(i, PIN_MODE_ANALOG)
                 else:
                     self._apply_mode(i, PIN_MODE_INSPECT)
             elif up_pressed or down_pressed:
                 direction = 1 if up_pressed else -1
-                if self.pin_modes[i] == PIN_MODE_INSPECT:
+                if self.pin_modes[i] in (PIN_MODE_INSPECT, PIN_MODE_ANALOG):
                     pass  # read-only: nothing to change
                 elif self.pin_modes[i] in INPUT_FAMILY:
                     other = PIN_MODE_LATCH if self.pin_modes[i] == PIN_MODE_INPUT else PIN_MODE_INPUT
@@ -955,10 +1166,18 @@ class PinTesterApp(app.App):
                 and time.ticks_diff(now, self.last_inspect_ms) >= INSPECT_POLL_MS):
             self._poll_inspect(now)
 
+        analog_tick = time.ticks_diff(now, self.last_analog_ms) >= ANALOG_POLL_MS
+        if analog_tick:
+            self.last_analog_ms = now
+
         for i in range(NUM_PINS):
             mode = self.pin_modes[i]
             if mode == PIN_MODE_INSPECT:
                 continue  # levels come from _poll_inspect()
+            if mode == PIN_MODE_ANALOG:
+                if self._ensure_pin(i) is not None and analog_tick:
+                    self._read_analog(i)
+                continue
             if mode in INPUT_FAMILY:
                 pin = self._ensure_pin(i)
                 if pin is None:
@@ -1044,6 +1263,8 @@ class PinTesterApp(app.App):
                 level_text, level = self._inspect_short(i)
             elif level is None:
                 level_text = "?"
+            elif self.pin_modes[i] == PIN_MODE_ANALOG:
+                level_text = "{:.2f}V".format(level / 1000)
             elif self.pin_modes[i] in LED_FAMILY:
                 level_text = "{}%".format(self._pct_from_duty(level))
             elif self.pin_modes[i] == PIN_MODE_PWM:
@@ -1054,6 +1275,8 @@ class PinTesterApp(app.App):
                 level_text = "HIGH" if level else "LOW"
             if self.pin_modes[i] == PIN_MODE_INSPECT:
                 colour = COLOR_INSPECT
+            elif self.pin_modes[i] == PIN_MODE_ANALOG:
+                colour = COLOR_ANALOG
             elif self.pin_modes[i] in LED_FAMILY:
                 colour = COLOR_LED
             else:
@@ -1125,6 +1348,8 @@ class PinTesterApp(app.App):
         mode = self.pin_modes[self.nav]
         if mode == PIN_MODE_INSPECT:
             return "C:take over pin"
+        if mode == PIN_MODE_ANALOG:
+            return "C:next mode"
         if mode == PIN_MODE_LED_BREATHE:
             return "U/D:time F:mode C:swap"
         if mode in LED_FAMILY:
@@ -1187,11 +1412,16 @@ class PinTesterApp(app.App):
             ctx.font_size = small_font_size
             ctx.rgb(1, 1, 1).move_to(0, -85).text("Port {}  I2C -- all".format(self.port))
             addr_strs = ["0x{:02x}".format(a) for a in (self.i2c_scan_result or [])]
-            groups = [addr_strs[i:i + 3] for i in range(0, len(addr_strs), 3)][:6]
+            all_groups = [addr_strs[i:i + 3] for i in range(0, len(addr_strs), 3)]
+            groups = all_groups[:I2C_ROWS_MAX]
             row_y = -55
             for group in groups:
                 ctx.rgb(0, 0.9, 0).move_to(0, row_y).text(", ".join(group))
                 row_y += 16
+            hidden = len(addr_strs) - 3 * I2C_ROWS_MAX
+            if hidden > 0:
+                # more addresses than fit: say so rather than dropping them silently
+                ctx.rgb(0.6, 0.6, 0.6).move_to(0, row_y).text("+{} more".format(hidden))
         elif self.nav == NAV_I2C:
             # Port label pinned to the very top (matching STATUS's title
             # position) to leave the middle of the screen free for however
@@ -1235,6 +1465,8 @@ class PinTesterApp(app.App):
             mode = self.pin_modes[i]
             if mode == PIN_MODE_INSPECT:
                 colour = COLOR_INSPECT
+            elif mode == PIN_MODE_ANALOG:
+                colour = COLOR_ANALOG
             elif mode in LED_FAMILY:
                 colour = COLOR_LED
             else:
@@ -1283,12 +1515,29 @@ class PinTesterApp(app.App):
                     active = n == self.pwm_field[i]
                     lines.append(("{} {} = {}".format(">" if active else " ", label, value),
                                   "", None, (1, 1, 0.3) if active else (0.8, 0.8, 0.8)))
+            elif mode == PIN_MODE_ANALOG:
+                mv, raw = self.adc_mv[i], self.adc_raw[i]
+                chan = adc_channel(self.port, name)
+                chan_text = "" if chan is None else "ADC{}_CH{}  GPIO{}".format(chan[0], chan[1], chan[2])
+                if mv is None:
+                    lines = [("voltage = ?", "", None, colour), (chan_text, "", None, (0.6, 0.6, 0.6))]
+                else:
+                    lines = [("voltage = ", "{:.3f} V".format(mv / 1000), mv, colour),
+                             ("raw = {} / 65535".format(raw), "", None, (0.8, 0.8, 0.8)),
+                             (chan_text, "", None, (0.6, 0.6, 0.6))]
             elif mode == PIN_MODE_OUTPUT_AUTO:
                 lines = [("blinking @2Hz", "", None, colour),
                          ("status = ", onoff_text, level, colour)]
             else:
                 lines = [("status = ", onoff_text, level, colour)]
             self._draw_value_lines(ctx, lines, VALUE_LINES_TOP)
+            if mode == PIN_MODE_ANALOG and self.adc_mv[i] is not None:
+                # voltage bar, 0 .. ANALOG_FULL_MV
+                bar_w, bar_h, bar_y = 120, 7, 50
+                frac = max(0, min(1, self.adc_mv[i] / ANALOG_FULL_MV))
+                ctx.rgb(0.2, 0.22, 0.26).rectangle(-bar_w // 2, bar_y, bar_w, bar_h).fill()
+                if frac > 0:
+                    ctx.rgb(*colour).rectangle(-bar_w // 2, bar_y, int(bar_w * frac), bar_h).fill()
 
         if self.status != "ready":
             ctx.font_size = small_font_size

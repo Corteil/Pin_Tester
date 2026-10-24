@@ -41,6 +41,11 @@ Per-pin modes:
 - **OUTPUT: OFF / ON** -- drive the pin to a fixed level.
 - **OUTPUT: AUTO** -- auto-blink the pin at ~2Hz, so a toggle counter or multimeter on the far
   end of the wire can confirm continuity without needing precise button timing.
+- **ANALOG IN** (HS pins on ports 4, 5 and 6 only) -- reads the pin's voltage with the ESP32-S3
+  ADC (about 0-3.1 V; shows volts, the raw reading and a bar). Ports 1-3 have no ADC pins and the
+  LS pins can't do analog. It's the step after PWM in the CONFIRM cycle. Reading analog
+  *reconfigures* the pin (unlike INSPECT ONLY), so avoid it on a pin a hexpansion is driving.
+  Ports 4 and 5 use ADC2, which can be unreliable while the radio is on; port 6 uses ADC1.
 - **LED: OFF / ON / BREATHE** (LS pins only) -- puts the pin in the AW9523B's constant-current
   LED/PWM mode (`pin.init(pin.PWM)` + `pin.duty(0-255)`) for testing an LED wired to the pin.
   UP/DOWN sets the brightness in 1% steps in OFF/ON (the set value is shown even while OFF);
@@ -53,8 +58,9 @@ colour-coded input/output), **PORT** (pick which hexpansion port, 1-6 -- also sh
 identification EEPROM's friendly name and VID/PID if a real hexpansion is present, checking
 both the `0x50` and `0x57` EEPROM addresses since larger EEPROMs use the latter), **I2C**
 (scans the port's I2C bus for a real device, and reports whether the system has an EEPROM
-filesystem mounted there -- file count, and whether an app is available), then each pin in
-turn.
+filesystem mounted there -- file count, and whether an app is available; UP/DOWN there switches to
+a "show all" list of every address, 18 at most, with a `+N more` line if there are more than
+that), then each pin in turn.
 
 - **PWM** (HS pins only) -- real ESP32 hardware PWM on the pin, 10 Hz to 100 kHz in 1-2-5 steps
   and duty 0-100% in 1% steps (the firmware can't generate below 10 Hz). CONFIRM cycles

@@ -18,7 +18,7 @@
 # functions, so both paths exercise identical logic.
 
 from system.hexpansion.config import HexpansionConfig, _pin_mapping
-from machine import mem32, I2C
+from machine import mem32, I2C, ADC, Pin
 import time
 
 # (primary name, secondary/functional name or "", pin list to index into,
@@ -272,3 +272,46 @@ def inspect_pins(port, names=None):
             continue
         result[primary] = _inspect_hs(port, idx) if kind == "hs" else _inspect_ls(cfg, idx, chip_regs)
     return result
+
+
+# --- Analog input ---------------------------------------------------------
+# Some HS pins are on ESP32-S3 GPIOs with an ADC channel: GPIO1-10 are ADC1
+# (channels 0-9), GPIO11-20 are ADC2. Of the hexpansion ports that's only
+# ports 4 and 5 (ADC2) and port 6 (ADC1) -- ports 1-3 have no analog pins. The
+# LS pins (I2C expander) can't do analog. ADC2 can be unreliable while the
+# radio is on (the badge uses ESP-NOW); ADC1 is unaffected.
+
+def adc_channel(port, name):
+    """(unit, channel, gpio) for a pin that can read analog, else None."""
+    for primary, secondary, kind, idx in PIN_INFO:
+        if name.upper() in (primary, secondary) and kind == "hs":
+            gpio = _pin_mapping[port]["hs"][idx]
+            if 1 <= gpio <= 10:
+                return (1, gpio - 1, gpio)
+            if 11 <= gpio <= 20:
+                return (2, gpio - 11, gpio)
+            return None
+    return None
+
+
+def _adc_atten():
+    return getattr(ADC, "ATTN_12DB", None) or ADC.ATTN_11DB  # ~0-3.1V
+
+
+def analog_read(port, name, samples=8):
+    """Read one HS pin as an analog input. Returns {"mv", "raw", "adc"}.
+    NOTE this reconfigures the pin as an analog input (unlike inspect_pins),
+    so don't use it on a pin another device is driving or using. Call
+    read()/write() afterwards to put the pin back to a digital input."""
+    info = adc_channel(port, name)
+    if info is None:
+        raise ValueError("no ADC on {} of port {} (only HS pins on ports 4-6)".format(name, port))
+    unit, channel, gpio = info
+    adc = ADC(Pin(gpio), atten=_adc_atten())
+    uv = raw = 0
+    for _ in range(samples):
+        uv += adc.read_uv()
+        raw += adc.read_u16()
+        time.sleep_ms(2)
+    return {"mv": uv // samples // 1000, "raw": raw // samples,
+            "adc": "ADC{}_CH{}".format(unit, channel)}
