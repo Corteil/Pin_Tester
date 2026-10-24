@@ -17,6 +17,22 @@ then go look at a different pin's input reading, and the first one keeps blinkin
 background the whole time.
 
 Per-pin modes:
+- **INSPECT ONLY** (the default for every pin *while a hexpansion is present on the port*) --
+  **hands off**: only reads how the pin is *already* set and never reconfigures it, so you can
+  open the app on a port that another app or a hexpansion is using without disturbing it. On an
+  **empty** port there's nothing to disturb, so pins default to plain INPUT instead; presence
+  comes from the badge's per-port hexpansion-detect line (see below) -- so it works for
+  hexpansions with no EEPROM or I2C device too -- plus an already-mounted EEPROM. It's
+  re-checked every 0.5s and the pins follow it. A pin whose
+  mode you've picked is never changed automatically. Shows direction (input/output), live level,
+  pull-up/down (HS pins), whether the pin is routed to a peripheral such as PWM (HS pins), and
+  GPIO vs LED mode (LS pins). The STATUS grid shows each as a compact `IN:H`, `OUT:L`, `PWM`,
+  `LED`... A pin is only changed once you press CONFIRM on its tile; cycling back round to
+  INSPECT releases it to a plain input and stops touching it. Limits: LED brightness can't be
+  read back (the expander's dim registers read as 0), and peripheral *input* routing (e.g. a
+  pin used as an SPI input) isn't detected. HS pins are read straight from the ESP32 GPIO/IO_MUX
+  registers; LS pins from the AW9523B expanders over I2C, and the live level of an LS *input*
+  is read the same way INPUT mode does it.
 - **INPUT** -- continuously read and display the live level (shown as HIGH/LOW, colour-coded
   green/red).
 - **LATCHED** -- like INPUT, but also remembers whether the pin has ever been seen HIGH
@@ -42,7 +58,7 @@ turn.
 
 - **PWM** (HS pins only) -- real ESP32 hardware PWM on the pin, 10 Hz to 100 kHz in 1-2-5 steps
   and duty 0-100% in 1% steps (the firmware can't generate below 10 Hz). CONFIRM cycles
-  INPUT -> OUTPUT -> PWM, F switches between editing frequency and duty, UP/DOWN changes the
+  INSPECT -> INPUT -> OUTPUT -> PWM, F switches between editing frequency and duty, UP/DOWN changes the
   field being edited (auto-repeating while held). Starts at 1 kHz / 50%. Each pin keeps its own
   PWM settings and runs independently. The LS pins can't do this (the expander only has
   fixed-frequency LED dimming) -- use their LED modes instead.
@@ -57,8 +73,8 @@ pin a live device is also driving.
 The moment a hexpansion is freshly detected on a port, every pin is passively probed once (a
 brief ~0.5s pause): each pin is watched at its own natural, unbiased level for a short window,
 and flagged "active" if it's ever seen to toggle during that window (no pull resistor bias is
-applied, so this can't itself perturb anything on the far end). Every pin lands on INPUT
-regardless of the result -- the probe only ever confirms activity, never a reason to choose
+applied, so this can't itself perturb anything on the far end). Pins still in INSPECT are only
+watched, never reconfigured; any pin you've taken over lands on INPUT regardless of the result -- the probe only ever confirms activity, never a reason to choose
 OUTPUT for you. Pins found active are marked "(auto)" on their own tile and with a trailing
 `*` on the STATUS grid.
 
@@ -68,13 +84,13 @@ Works on any badge/frontboard:
 
 | Button | Action |
 |---|---|
-| LEFT / RIGHT | Move between tiles: STATUS, PORT, I2C, then each pin |
-| UP / DOWN (on PORT or STATUS tile) | Change the hexpansion port (1-6) -- resets every pin to INPUT, since it's a different physical connector |
+| LEFT / RIGHT | Move between tiles: STATUS, PORT, I2C, then the LS pins (LS_A-LS_E), then the HS pins (HS_F-HS_I). **Hold** to jump a whole section at a time: home -> LS pins -> HS pins |
+| UP / DOWN (on PORT or STATUS tile) | Change the hexpansion port (1-6) -- hands every pin back (anything we took over is released to INPUT, then all pins return to read-only INSPECT), since it's a different physical connector |
 | UP / DOWN (on I2C tile) | Toggle between the compact address list and a full-list view (when there are more addresses than fit compactly) |
 | CONFIRM (on STATUS tile) | Toggle "Remote: ON/OFF" (see below) |
-| CONFIRM (on a pin tile) | Switch that pin between its INPUT family (INPUT/LATCHED) and OUTPUT family (OFF/ON/AUTO) and, on LS pins, LED family (CONFIRM cycles INPUT -> OUTPUT -> LED) |
+| CONFIRM (on a pin tile) | Cycle that pin's family: INSPECT (read-only) -> INPUT/LATCHED -> OUTPUT (OFF/ON/AUTO) -> LED (LS pins) or PWM (HS pins) -> back to INSPECT |
 | UP / DOWN (on a pin tile) | Within INPUT family: toggle INPUT <-> LATCHED. Within OUTPUT family: cycle OFF -> ON -> AUTO. Within LED family: brightness (OFF/ON) or breathe cycle time. F short press cycles LED OFF/ON/BREATHE |
-| CANCEL, short press | On the STATUS tile: reset every pin on the port to its safe INPUT default (also clears LED and PWM settings) -- the first press only asks "Reset all pins?", press F again within 3s to confirm, any other button cancels. On a pin tile: reset that pin's LATCHED indicator (or cycle LED OFF/ON/BREATHE in an LED mode) |
+| CANCEL, short press | On the STATUS tile: hand every pin back: anything we took over is released to INPUT, then all pins return to read-only INSPECT (also clears LED and PWM settings) -- the first press only asks "Reset all pins?", press F again within 3s to confirm, any other button cancels. On a pin tile: reset that pin's LATCHED indicator (or cycle LED OFF/ON/BREATHE in an LED mode) |
 | CANCEL, held | Exit the app |
 
 Joystick bonus (2026 frontboard only -- harmless no-ops on other hardware):
@@ -112,7 +128,10 @@ Importing straight off `sys.path` skips that entirely and works standalone.
 
 Available functions: `read(port, name)`, `write(port, name, value)`,
 `blink(port, name, duration_ms=3000, period_ms=250)`, `blink_all(port, ...)`,
-`read_all(port)`, and `latch(port, name, duration_ms=3000, poll_ms=2)`.
+`read_all(port)`, `latch(port, name, duration_ms=3000, poll_ms=2)`, `led(port, name, ...)`, and
+`inspect_pins(port, names=None)` -- a read-only snapshot of how pins are currently configured
+(func/dir/level/pull for HS, func/dir/level for LS) that never calls `.init()`, so it's safe
+against a port something else is using.
 
 ### Live, while the app keeps running on screen
 
@@ -130,6 +149,8 @@ printf 'SET HS_F ON\n' > /dev/ttyACM0
 
 Commands, one per line:
 - `STATUS` -- every pin's `name=level`
+- `INSPECT [<pin>]` -- fresh read-only snapshot of how the pin(s) are currently configured
+- `SET <pin> INSPECT` -- hands off again (releases the pin to INPUT, then read-only)
 - `GET <pin>` -- one pin's current level
 - `SET <pin> IN|LATCH|OFF|ON|AUTO` -- change a pin's mode
 - `SET <pin> PWM [hz [duty]]` -- HS pins only
@@ -148,11 +169,13 @@ launcher menu.
 
 The hexpansion connector's dedicated `HEXP_DET` presence-detect line (pulled up on the badge,
 tied to GND by a real hexpansion PCB on insertion -- see the [Hexi-GFX
-README](https://github.com/Corteil/rp2350-hdmi-hexpansion)'s own pinout section) isn't
-testable here. It's not exposed via `system.hexpansion.config.HexpansionConfig` the way the
-HS/LS pins are -- presence detection appears to happen at a lower level (likely read directly
-off the AW9523B GPIO expander) and only surfaces to Python as
-`HexpansionInsertionEvent`/`HexpansionRemovalEvent`, not as a raw pin.
+README](https://github.com/Corteil/rp2350-hdmi-hexpansion)'s own pinout section) is **not** a
+pin on the port, so it isn't testable like the HS/LS pins -- but the badge does expose it:
+`system.hexpansion.app` reads it from six expander pins, `ePin(tildagonos.EPIN_ND_A..F)` for
+ports 1-6, where `.value() == 0` means a hexpansion is plugged in. This app reads those to decide
+whether a port is in use (INSPECT ONLY vs plain INPUT) and shows the state on the PORT tile
+(`detect line: present / empty`). It can only tell you something is plugged in, not whether
+`HEXP_DET` is wired correctly on a particular board beyond that.
 
 ## Pin naming
 

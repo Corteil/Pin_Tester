@@ -20,8 +20,12 @@
 # > /dev/ttyACM0`, with a separate `cat /dev/ttyACM0` (or similar) reading
 # the response back. Commands, one per line:
 #   STATUS                          -- every pin's name=level
+#   INSPECT [<pin>]                 -- fresh read-only snapshot of how the
+#                                      pin(s) are currently configured
 #   GET <pin>                       -- one pin's current level
 #   SET <pin> IN|LATCH|OFF|ON|AUTO      -- change a pin's mode
+#   SET <pin> INSPECT                   -- hands off again (releases the pin
+#                                          to INPUT, then read-only)
 #   SET <pin> PWM [hz [duty]]           -- HS pins only: hardware PWM
 #   SET <pin> LEDOFF|LEDON|BREATHE [n]  -- LED modes, LS_A..LS_E only; n is
 #                                          brightness 0-100 (LEDON) or
@@ -38,40 +42,57 @@
 # coded by whether that pin is currently an input (cyan) or an output
 # (orange), so you can watch several pins' real states simultaneously.
 #
-# Tiles, reached via LEFT/RIGHT (wrapping): PORT, STATUS, then each pin.
+# Tiles, reached via LEFT/RIGHT (wrapping): STATUS, PORT, I2C, then the LS
+# pins (LS_A..LS_E), then the HS pins (HS_F..HS_I). Holding LEFT/RIGHT jumps
+# a whole section at a time: home -> LS pins -> HS pins.
+#
+# HANDS OFF WHEN A HEXPANSION IS PRESENT: while one is detected on the
+# port (its EEPROM is mounted, or the port's I2C bus answered), pins you
+# haven't picked a mode for sit in INSPECT ONLY, which just READS how the
+# pin is already configured (direction, level, pull-up/down, whether it's
+# routed to a peripheral such as PWM, GPIO vs LED mode on the LS pins) and
+# never calls init() -- so opening this app on a port another app or
+# hexpansion is already using changes nothing. On an EMPTY port there is
+# nothing to disturb, so those pins are plain INPUT instead. Presence is
+# re-checked every 0.5s and the pins follow it; a pin whose mode you've
+# picked (CONFIRM on its tile) is never changed automatically. The reading
+# logic is pin_control.inspect_pins(), also usable over USB/REPL.
 #
 # Controls (work on any badge/frontboard):
 #   LEFT/RIGHT  -- move between tiles: PORT, STATUS, pin 1, pin 2, ...
 #   On the PORT tile:
-#     UP/DOWN   -- change the hexpansion port (1-6) -- resets every pin
-#                  back to a safe INPUT default, since it's a different
-#                  physical connector.
+#     UP/DOWN   -- change the hexpansion port (1-6) -- hands every pin
+#                  back (anything we took over is released to INPUT,
+#                  then all pins go back to read-only INSPECT), since
+#                  it's a different physical connector.
 #   On the STATUS tile:
 #     CONFIRM   -- toggle "remote control active" (a pure informational
 #                  flag shown on STATUS, for noting you intend to drive/
 #                  read pins externally -- e.g. via another mpremote/
 #                  pin_control call -- has no other effect on its own).
 #   On a pin tile:
-#     CONFIRM   -- switch the pin between its INPUT family (FOLLOW/
-#                  LATCHED), its OUTPUT family (OFF/ON/AUTO) and, on LS
-#                  pins, its LED family.
+#     CONFIRM   -- cycle the pin's family: INSPECT (read-only) -> INPUT
+#                  (FOLLOW/LATCHED) -> OUTPUT (OFF/ON/AUTO) -> LED (LS) or
+#                  PWM (HS) -> back to INSPECT, which releases the pin to
+#                  INPUT and stops touching it.
 #     UP/DOWN   -- within INPUT family: toggle FOLLOW <-> LATCHED.
 #                  within OUTPUT family: cycle OFF -> ON -> AUTO -> OFF.
 #                  within LED family: change brightness (LED OFF/ON) or
 #                  breathe cycle time (BREATHE).
 #     LS pins also have a third family, LED (the AW9523B's constant-current
 #     LED/PWM mode, for testing an LED wired to the pin): CONFIRM cycles
-#     INPUT -> OUTPUT -> LED -> INPUT, and F (short press) cycles
+#     INSPECT -> INPUT -> OUTPUT -> LED -> INSPECT, and F (short press) cycles
 #     LED OFF -> LED ON -> BREATHE. In the LED modes UP/DOWN auto-repeats
 #     while held (after a short delay, faster the longer it's held).
 #   HS pins have a third family too, PWM (real ESP32 hardware PWM, 10Hz to
-#   100kHz): CONFIRM cycles INPUT -> OUTPUT -> PWM -> INPUT, F (short
+#   100kHz): CONFIRM cycles ... -> OUTPUT -> PWM -> INSPECT, F (short
 #   press) switches between editing frequency and duty, and UP/DOWN
 #   changes the field being edited (auto-repeating while held). Each pin
 #   keeps its own PWM running independently, like every other mode.
 #   CANCEL (F)  -- short press: on the STATUS tile, reset (press twice to
 #                  confirm -- the first press only arms it) every pin on the
-#                  port to its safe INPUT default (also clears LED
+#                  port: anything we took over is released to INPUT, then
+#                  all pins go back to read-only INSPECT (also clears LED
 #                  brightness/cycle-time settings); on a pin tile, reset the
 #                  current pin's LATCHED indicator
 #                  (or, in an LED mode, cycle LED OFF/ON/BREATHE).
@@ -105,6 +126,17 @@ from events.input import Buttons, BUTTON_TYPES
 from app_components.tokens import clear_background, small_font_size, label_font_size
 from system.hexpansion.config import HexpansionConfig
 try:
+    # The badge's per-port hexpansion-detect lines (low = a hexpansion is
+    # plugged in), the same ones system.hexpansion.app reads. Index 0 is
+    # port 1.
+    from egpio import ePin
+    from tildagonos import (EPIN_ND_A, EPIN_ND_B, EPIN_ND_C,
+                            EPIN_ND_D, EPIN_ND_E, EPIN_ND_F)
+    DETECT_PINS = (EPIN_ND_A, EPIN_ND_B, EPIN_ND_C, EPIN_ND_D, EPIN_ND_E, EPIN_ND_F)
+except ImportError:
+    ePin = None
+    DETECT_PINS = ()
+try:
     from system.hexpansion.util import read_hexpansion_header, detect_eeprom_addr
 except ImportError:
     read_hexpansion_header = None
@@ -122,12 +154,12 @@ try:
     # installed under (sideloading uses "pin_tester", but the app store
     # installs to "<owner>_<repo>", e.g. "Corteil_Pin_Tester" -- a
     # hardcoded absolute path here broke store installs).
-    from .pin_control import PIN_INFO, _resolve
+    from .pin_control import PIN_INFO, _resolve, inspect_pins
 except ImportError:
     # Falls back to a bare import for standalone script execution (no
     # package context), e.g. testing app.py directly rather than through
     # the launcher.
-    from pin_control import PIN_INFO, _resolve
+    from pin_control import PIN_INFO, _resolve, inspect_pins
 
 NUM_PINS = len(PIN_INFO)
 NAV_STATUS = -3
@@ -144,8 +176,9 @@ PIN_MODE_LED_OFF = 5  # LS pins only: AW9523B LED (PWM) mode
 PIN_MODE_LED_ON = 6
 PIN_MODE_LED_BREATHE = 7
 PIN_MODE_PWM = 8      # HS pins only: ESP32 hardware PWM
+PIN_MODE_INSPECT = 9  # read-only: show how the pin is already set, never touch it
 PIN_MODE_LABELS = ("INPUT", "LATCHED", "OUTPUT: OFF", "OUTPUT: ON", "OUTPUT: AUTO",
-                   "LED: OFF", "LED: ON", "LED: BREATHE", "PWM")
+                   "LED: OFF", "LED: ON", "LED: BREATHE", "PWM", "INSPECT ONLY")
 INPUT_FAMILY = (PIN_MODE_INPUT, PIN_MODE_LATCH)
 OUTPUT_FAMILY = (PIN_MODE_OUTPUT_OFF, PIN_MODE_OUTPUT_ON, PIN_MODE_OUTPUT_AUTO)
 LED_FAMILY = (PIN_MODE_LED_OFF, PIN_MODE_LED_ON, PIN_MODE_LED_BREATHE)
@@ -153,6 +186,8 @@ LED_FAMILY = (PIN_MODE_LED_OFF, PIN_MODE_LED_ON, PIN_MODE_LED_BREATHE)
 COLOR_INPUT = (0, 1, 1)      # cyan
 COLOR_OUTPUT = (1, 0.55, 0)  # orange
 COLOR_LED = (1, 1, 0.3)      # yellow
+COLOR_INSPECT = (0.75, 0.75, 0.75)  # grey
+COLOR_WARN = (1, 0.7, 0)     # hexpansion-present warning, INSPECT ONLY label
 
 BLINK_PERIOD_MS = 250  # ~2Hz full cycle
 LONG_PRESS_MS = 600
@@ -166,7 +201,15 @@ PWM_FIELD_FREQ = 0
 PWM_FIELD_DUTY = 1
 # Hold-to-repeat for UP/DOWN in the LED modes.
 RESET_CONFIRM_MS = 3000  # window for the second F press that confirms a pin reset
+INSPECT_POLL_MS = 250  # how often read-only pin snapshots refresh
+GRID_FONT_SCALE = 0.85  # STATUS tile pin grid text is drawn smaller than normal text
+VALUE_LINES_TOP = -6    # pin tile: first value line, near the display's middle
+VALUE_LINE_STEP = 20
+DISPLAY_RADIUS = 120    # round 240px display
+DISPLAY_MARGIN = 6      # keep text this far inside the edge
 HINT_FONT_SCALE = 0.8  # bottom hint lines are drawn smaller than normal text
+NAV_JUMP_DELAY_MS = 500   # hold LEFT/RIGHT this long to jump a whole section
+NAV_JUMP_REPEAT_MS = 700  # ...then keep jumping this often while still held
 HOLD_DELAY_MS = 400    # held this long before repeating starts
 HOLD_REPEAT_MS = 100   # step interval while repeating
 HOLD_ACCEL_MS = 1500   # held this long, repeat speeds up
@@ -192,12 +235,15 @@ class PinTesterApp(app.App):
         self.cancel_exit_triggered = False
         self.reset_msg_until = None
         self.reset_armed_until = None
+        self.nav_hold_dir = 0
+        self.nav_hold_next = 0
         self.hold_dir = 0
         self.hold_key = None
         self.hold_start = 0
         self.hold_last = 0
         self.blink_state = False
         self.last_blink_ms = time.ticks_ms()
+        self.last_inspect_ms = 0
         self.i2c_scan_result = None
         self.i2c_scan_error = None
         self.last_i2c_scan_ms = 0
@@ -207,6 +253,8 @@ class PinTesterApp(app.App):
         self.hexpansion_pid = None
         self.last_hexpansion_present = False
         self.last_presence_check_ms = 0
+        self.port_present = False
+        self.detect_line = None  # True/False from the detect pin, None if unreadable
         # Non-blocking remote command channel -- lets an external tool
         # write plain text lines to this same USB serial port (raw, NOT
         # via mpremote's exec/cp, which always sends Ctrl-C first and would
@@ -237,7 +285,17 @@ class PinTesterApp(app.App):
                 except Exception:
                     pass
         self.pin_objs = [None] * NUM_PINS
-        self.pin_modes = [PIN_MODE_INPUT] * NUM_PINS
+        # Pins start in read-only INSPECT; _sync_default_modes() (next
+        # update) then settles them on INSPECT if a hexpansion is present
+        # or plain INPUT if the port is empty.
+        self.pin_modes = [PIN_MODE_INSPECT] * NUM_PINS
+        self.inspect_info = [None] * NUM_PINS
+        # Pins you haven't picked a mode for follow the port: read-only
+        # INSPECT while a hexpansion is present (so we don't disturb it),
+        # plain INPUT when the port is empty (nothing to disturb).
+        self.pin_user_set = [False] * NUM_PINS
+        self.modes_sync_pending = True
+        self.sync_present = None
         self.latch_high = [False] * NUM_PINS
         self.latch_low = [False] * NUM_PINS
         self.live_levels = [None] * NUM_PINS
@@ -307,15 +365,30 @@ class PinTesterApp(app.App):
             return {"mounted": False, "count": 0, "has_app": False}
 
     def _hexpansion_present(self):
-        # A real device answering on the I2C bus, or an already-mounted
-        # EEPROM filesystem, both indicate something is actually plugged
-        # into this port right now -- used to warn before driving OUTPUT
-        # onto pins a live device might also be driving.
-        if self.i2c_scan_result:
-            return True
-        return self._check_eeprom()["mounted"]
+        # Cached result of _refresh_presence() -- this is called every
+        # frame from draw(), so it must not touch the bus itself.
+        return self.port_present
 
-    def _passive_probe_pin(self, pin, duration_ms=60, poll_ms=2):
+    def _refresh_presence(self):
+        # The detect line is the authority: it goes low the instant a
+        # hexpansion is plugged in, with or without an EEPROM or any I2C
+        # device on it. An already-mounted EEPROM also counts. If the
+        # detect line can't be read, fall back to a device having
+        # answered the last I2C scan.
+        detect = None
+        try:
+            if ePin is not None:
+                detect = ePin(DETECT_PINS[self.port - 1]).value() == 0
+        except Exception:
+            detect = None
+        eeprom = self._check_eeprom()["mounted"]
+        if detect is None:
+            self.port_present = eeprom or bool(self.i2c_scan_result)
+        else:
+            self.port_present = detect or eeprom
+        self.detect_line = detect
+
+    def _passive_probe_pin(self, pin, duration_ms=60, poll_ms=2, configure=True):
         # Purely passive: just watches the pin's own natural value over a
         # short window, no pull resistor bias at all -- never risks even
         # the mild "spurious edge on a sensitive far-end input" concern an
@@ -323,7 +396,8 @@ class PinTesterApp(app.App):
         # is actually seen to toggle during the window (the same ever-
         # high/ever-low idea LATCH mode already uses) -- a pin that just
         # sits constant is left ambiguous, not assumed to be either type.
-        pin.init(pin.IN)
+        if configure:
+            pin.init(pin.IN)
         seen_high = False
         seen_low = False
         end = time.ticks_add(time.ticks_ms(), duration_ms)
@@ -337,26 +411,49 @@ class PinTesterApp(app.App):
 
     def _auto_detect_pin_types(self):
         # Runs once when a hexpansion is freshly detected on this port
-        # (see the presence-transition check in update()). Every pin
-        # always lands on INPUT regardless of the result -- passive
+        # (see the presence-transition check in update()). Every pin we
+        # control lands on INPUT regardless of the result -- passive
         # monitoring only ever confirms activity, it's never grounds to
         # pick OUTPUT for you. pin_auto_detected just drives the "auto"
         # label shown on STATUS/pin tiles.
         for i, (name, _secondary, _kind, _idx) in enumerate(PIN_INFO):
             try:
                 pin = _resolve(self.port, name)
-                active = self._passive_probe_pin(pin)
+                # Pins still in hands-off INSPECT mode are only watched,
+                # never reconfigured.
+                active = self._passive_probe_pin(
+                    pin, configure=self.pin_modes[i] != PIN_MODE_INSPECT)
             except Exception:
                 active = False
             self.pin_auto_detected[i] = active
-            self._apply_mode(i, PIN_MODE_INPUT)
+            if self.pin_modes[i] != PIN_MODE_INSPECT:
+                self._apply_mode(i, PIN_MODE_INPUT, user=None)
         self.status = "ready"
 
-    def _apply_mode(self, i, mode):
+    def _apply_mode(self, i, mode, user=True):
+        # user: True when you picked this mode (it then sticks regardless of
+        # whether a hexpansion is present), False for the automatic
+        # INSPECT/INPUT default, None to leave that flag alone.
+        if user is not None:
+            self.pin_user_set[i] = user
         self._pwm_stop(i)  # release any running PWM before reconfiguring
         self.pin_modes[i] = mode
         self.latch_high[i] = False
         self.latch_low[i] = False
+        if mode == PIN_MODE_INSPECT:
+            # Hands off from here on. If we had taken the pin over, release
+            # it to a plain input first so nothing is left driving.
+            if self.pin_objs[i] is not None:
+                try:
+                    self.pin_objs[i].init(self.pin_objs[i].IN)
+                except Exception:
+                    pass
+            self.pin_objs[i] = None
+            self.live_levels[i] = None
+            self.inspect_info[i] = None
+            self.last_inspect_ms = 0  # refresh immediately
+            self.status = "ready"
+            return
         try:
             pin = _resolve(self.port, PIN_INFO[i][0])
             if mode == PIN_MODE_OUTPUT_OFF:
@@ -388,6 +485,82 @@ class PinTesterApp(app.App):
         except Exception as e:
             self.status = "pin error: {!r}".format(e)
             self.pin_objs[i] = None
+
+    def _nav_section_starts(self):
+        # Tile sections in order: home (STATUS/PORT/I2C), then each pin
+        # group (LS pins, HS pins) -- each represented by its first tile.
+        starts = [NAV_STATUS]
+        seen = []
+        for i, (_n, _s, kind, _x) in enumerate(PIN_INFO):
+            if kind not in seen:
+                seen.append(kind)
+                starts.append(i)
+        return starts, seen
+
+    def _nav_hold_jump(self, left_pressed, right_pressed):
+        # Holding LEFT/RIGHT jumps a whole section at a time: home -> LS
+        # pins -> HS pins (the normal single step already happened on the
+        # initial press, via Buttons.pressed()).
+        now = time.ticks_ms()
+        if left_pressed or right_pressed:
+            self.nav_hold_dir = 1 if right_pressed else -1
+            self.nav_hold_next = time.ticks_add(now, NAV_JUMP_DELAY_MS)
+            return
+        if self.nav_hold_dir == 0:
+            return
+        button = "RIGHT" if self.nav_hold_dir > 0 else "LEFT"
+        if not self.buttons.get(BUTTON_TYPES[button]):
+            self.nav_hold_dir = 0
+            return
+        if time.ticks_diff(now, self.nav_hold_next) < 0:
+            return
+        starts, kinds = self._nav_section_starts()
+        if self.nav < 0:
+            section = 0
+        else:
+            section = 1 + kinds.index(PIN_INFO[self.nav][2])
+        self.nav = starts[(section + self.nav_hold_dir) % len(starts)]
+        self.nav_hold_next = time.ticks_add(now, NAV_JUMP_REPEAT_MS)
+
+    def _sync_default_modes(self):
+        present = self.port_present
+        self.sync_present = present
+        self.modes_sync_pending = False
+        target = PIN_MODE_INSPECT if present else PIN_MODE_INPUT
+        for i in range(NUM_PINS):
+            if not self.pin_user_set[i] and self.pin_modes[i] != target:
+                self._apply_mode(i, target, user=False)
+
+    def _poll_inspect(self, now):
+        # Read-only snapshot of every hands-off pin (see
+        # pin_control.inspect_pins) -- nothing here reconfigures a pin.
+        self.last_inspect_ms = now
+        names = [PIN_INFO[i][0] for i in range(NUM_PINS)
+                 if self.pin_modes[i] == PIN_MODE_INSPECT]
+        try:
+            snap = inspect_pins(self.port, names)
+        except Exception as e:
+            self.status = "inspect error: {!r}".format(e)
+            return
+        for i in range(NUM_PINS):
+            if self.pin_modes[i] == PIN_MODE_INSPECT:
+                info = snap.get(PIN_INFO[i][0])
+                self.inspect_info[i] = info
+                self.live_levels[i] = None if info is None else info["level"]
+
+    def _inspect_short(self, i):
+        # Compact (text, level-for-colouring) used on the STATUS grid.
+        info = self.inspect_info[i]
+        if info is None:
+            return "?", None
+        if info["func"] == "led":
+            return "LED", None
+        if info["func"] == "pwm":
+            return "PWM", None
+        if info["func"] == "periph":
+            return "PERIP", None
+        return "{}:{}".format("OUT" if info["dir"] == "out" else "IN",
+                              "H" if info["level"] else "L"), info["level"]
 
     def _led_breathe_duty(self, i):
         # Triangle wave 0..led_level..0 over the pin's cycle time.
@@ -488,7 +661,7 @@ class PinTesterApp(app.App):
             self.live_levels[i] = self.pwm_duty[i]
         except Exception as e:
             self.status = "pwm error: {!r}".format(e)
-            self._apply_mode(i, PIN_MODE_INPUT)
+            self._apply_mode(i, PIN_MODE_INPUT, user=None)
 
     def _adjust_mode_value(self, i, direction):
         # UP/DOWN auto-repeat target for the LED and PWM modes.
@@ -503,7 +676,7 @@ class PinTesterApp(app.App):
 
     def _ensure_pin(self, i):
         if self.pin_objs[i] is None:
-            self._apply_mode(i, self.pin_modes[i])
+            self._apply_mode(i, self.pin_modes[i], user=None)
         return self.pin_objs[i]
 
     def _pin_index_by_name(self, name):
@@ -545,6 +718,7 @@ class PinTesterApp(app.App):
             "LEDON": PIN_MODE_LED_ON,
             "BREATHE": PIN_MODE_LED_BREATHE,
             "PWM": PIN_MODE_PWM,
+            "INSPECT": PIN_MODE_INSPECT,
         }
         parts = line.split()
         if not parts:
@@ -561,6 +735,13 @@ class PinTesterApp(app.App):
                     print("ERR unknown pin {}".format(parts[1]))
                 else:
                     print("GET {} {}".format(parts[1], self.live_levels[i]))
+            elif cmd == "INSPECT":
+                # Fresh read-only snapshot, e.g. "INSPECT" or "INSPECT HS_F".
+                names = [parts[1]] if len(parts) >= 2 else None
+                for name, info in inspect_pins(self.port, names).items():
+                    fields = ["{}={}".format(k, info[k])
+                              for k in ("func", "dir", "level", "pull") if k in info]
+                    print("INSPECT {} {}".format(name, " ".join(fields)))
             elif cmd == "SET" and len(parts) >= 3:
                 i = self._pin_index_by_name(parts[1])
                 mode_word = parts[2].upper()
@@ -612,6 +793,12 @@ class PinTesterApp(app.App):
             if now_present and not self.last_hexpansion_present:
                 self._auto_detect_pin_types()
             self.last_hexpansion_present = now_present
+            self._refresh_presence()
+            if self.port_present != self.sync_present:
+                self._sync_default_modes()
+        if self.modes_sync_pending:
+            self._refresh_presence()
+            self._sync_default_modes()
 
         # CANCEL (physical F): short press resets the current pin's latch,
         # long press exits. Tracked manually since Buttons.pressed() is
@@ -651,14 +838,17 @@ class PinTesterApp(app.App):
             self.cancel_press_start = None
             self.cancel_exit_triggered = False
 
-        if self.buttons.pressed(BUTTON_TYPES["LEFT"]):
+        left_pressed = self.buttons.pressed(BUTTON_TYPES["LEFT"])
+        right_pressed = self.buttons.pressed(BUTTON_TYPES["RIGHT"])
+        if left_pressed:
             self.nav -= 1
             if self.nav < NAV_STATUS:
                 self.nav = NUM_PINS - 1
-        elif self.buttons.pressed(BUTTON_TYPES["RIGHT"]):
+        elif right_pressed:
             self.nav += 1
             if self.nav > NUM_PINS - 1:
                 self.nav = NAV_STATUS
+        self._nav_hold_jump(left_pressed, right_pressed)
 
         if self.nav != NAV_STATUS:
             self.reset_armed_until = None
@@ -713,17 +903,21 @@ class PinTesterApp(app.App):
             up_pressed = self.buttons.pressed(BUTTON_TYPES["UP"])
             down_pressed = self.buttons.pressed(BUTTON_TYPES["DOWN"])
             if self.buttons.pressed(BUTTON_TYPES["CONFIRM"]):
-                # Cycle this pin's family: INPUT -> OUTPUT -> LED (LS pins)
-                # or PWM (HS pins) -> INPUT.
-                if self.pin_modes[i] in INPUT_FAMILY:
+                # Cycle this pin's family: INSPECT -> INPUT -> OUTPUT ->
+                # LED (LS pins) or PWM (HS pins) -> INSPECT.
+                if self.pin_modes[i] == PIN_MODE_INSPECT:
+                    self._apply_mode(i, PIN_MODE_INPUT)
+                elif self.pin_modes[i] in INPUT_FAMILY:
                     self._apply_mode(i, PIN_MODE_OUTPUT_OFF)
                 elif self.pin_modes[i] in OUTPUT_FAMILY:
                     self._apply_mode(i, PIN_MODE_LED_OFF if PIN_INFO[i][2] == "ls" else PIN_MODE_PWM)
                 else:
-                    self._apply_mode(i, PIN_MODE_INPUT)
+                    self._apply_mode(i, PIN_MODE_INSPECT)
             elif up_pressed or down_pressed:
                 direction = 1 if up_pressed else -1
-                if self.pin_modes[i] in INPUT_FAMILY:
+                if self.pin_modes[i] == PIN_MODE_INSPECT:
+                    pass  # read-only: nothing to change
+                elif self.pin_modes[i] in INPUT_FAMILY:
                     other = PIN_MODE_LATCH if self.pin_modes[i] == PIN_MODE_INPUT else PIN_MODE_INPUT
                     self._apply_mode(i, other)
                 elif self.pin_modes[i] in LED_FAMILY:
@@ -757,8 +951,14 @@ class PinTesterApp(app.App):
             self.last_blink_ms = now
             self.blink_state = not self.blink_state
 
+        if (PIN_MODE_INSPECT in self.pin_modes
+                and time.ticks_diff(now, self.last_inspect_ms) >= INSPECT_POLL_MS):
+            self._poll_inspect(now)
+
         for i in range(NUM_PINS):
             mode = self.pin_modes[i]
+            if mode == PIN_MODE_INSPECT:
+                continue  # levels come from _poll_inspect()
             if mode in INPUT_FAMILY:
                 pin = self._ensure_pin(i)
                 if pin is None:
@@ -830,6 +1030,7 @@ class PinTesterApp(app.App):
         # font -- centring here caused a visible jitter every time the
         # value changed.
         ctx.text_align = ctx.LEFT
+        ctx.font_size = small_font_size * GRID_FONT_SCALE
         cols_x = (-95, 15)  # roughly symmetric around centre, wide enough for "NAME: HIGH"
         row_step = 18
         for i, (name, _secondary, _kind, _idx) in enumerate(PIN_INFO):
@@ -839,7 +1040,9 @@ class PinTesterApp(app.App):
             y = top_y + row * row_step
             level = self.live_levels[i]
             is_output = self.pin_modes[i] in OUTPUT_FAMILY
-            if level is None:
+            if self.pin_modes[i] == PIN_MODE_INSPECT:
+                level_text, level = self._inspect_short(i)
+            elif level is None:
                 level_text = "?"
             elif self.pin_modes[i] in LED_FAMILY:
                 level_text = "{}%".format(self._pct_from_duty(level))
@@ -849,13 +1052,67 @@ class PinTesterApp(app.App):
                 level_text = "ON" if level else "OFF"
             else:
                 level_text = "HIGH" if level else "LOW"
-            if self.pin_modes[i] in LED_FAMILY:
+            if self.pin_modes[i] == PIN_MODE_INSPECT:
+                colour = COLOR_INSPECT
+            elif self.pin_modes[i] in LED_FAMILY:
                 colour = COLOR_LED
             else:
                 colour = COLOR_OUTPUT if is_output or self.pin_modes[i] == PIN_MODE_PWM else COLOR_INPUT
             if self.pin_auto_detected[i]:
                 level_text += "*"  # auto-detected as actively driven on hexpansion insertion
             self._draw_status_value(ctx, x, y, "{}: ".format(name), level_text, level, colour)
+        ctx.text_align = ctx.CENTER
+
+    def _inspect_lines(self, i, colour):
+        # Read-only description of how this pin is currently set (as
+        # found), straight from pin_control.inspect_pins(), as value lines
+        # for _draw_value_lines().
+        info = self.inspect_info[i]
+        if info is None:
+            return [("reading...", "", None, (0.6, 0.6, 0.6))]
+        dir_text = "OUTPUT" if info["dir"] == "out" else "INPUT"
+        if info["kind"] == "hs":
+            if info["func"] == "pwm":
+                func = "PWM (LEDC)"
+            elif info["func"] == "periph":
+                func = "peripheral #{}".format(info["sel"])
+            else:
+                func = "GPIO"
+            lines = [("func = " + func, "", None, colour), ("dir = " + dir_text, "", None, colour)]
+            level_label = "level = "
+        else:
+            lines = [("mode = " + ("LED (dim n/a)" if info["func"] == "led" else "GPIO"),
+                      "", None, colour)]
+            if info["func"] != "led":
+                lines.append(("dir = " + dir_text, "", None, colour))
+            level_label = "drives = " if info["dir"] == "out" else "level = "
+        if info["func"] == "gpio":
+            lvl = info["level"]
+            lines.append((level_label, "HIGH" if lvl else "LOW", lvl, colour))
+        if info["kind"] == "hs":
+            lines.append(("pull = {}".format(info["pull"]), "", None, colour))
+        return lines
+
+    def _draw_value_lines(self, ctx, lines, top_y, step=VALUE_LINE_STEP):
+        # Draws (prefix, value, level, colour) lines left-aligned from one
+        # shared x. x is chosen from the widest line so the block is
+        # centred, then limited so the widest line doesn't run off the
+        # round display at the lowest row (the display is a circle, so the
+        # usable width shrinks towards the top and bottom).
+        def width(text):
+            try:
+                return ctx.text_width(text)
+            except Exception:
+                return len(text) * 7
+
+        widest = max(width(prefix) + width(value) for prefix, value, _l, _c in lines)
+        last_y = top_y + step * (len(lines) - 1)
+        edge_y = max(abs(top_y), abs(last_y)) + 8  # text half-height
+        chord_half = max(0, DISPLAY_RADIUS ** 2 - edge_y ** 2) ** 0.5 - DISPLAY_MARGIN
+        x = -min(widest / 2, chord_half)
+        ctx.text_align = ctx.LEFT
+        for n, (prefix, value, level, colour) in enumerate(lines):
+            self._draw_status_value(ctx, x, top_y + n * step, prefix, value, level, colour)
         ctx.text_align = ctx.CENTER
 
     def _hint_text(self):
@@ -866,6 +1123,8 @@ class PinTesterApp(app.App):
         if self.nav == NAV_STATUS:
             return "C:remote F:reset"
         mode = self.pin_modes[self.nav]
+        if mode == PIN_MODE_INSPECT:
+            return "C:take over pin"
         if mode == PIN_MODE_LED_BREATHE:
             return "U/D:time F:mode C:swap"
         if mode in LED_FAMILY:
@@ -898,22 +1157,28 @@ class PinTesterApp(app.App):
                 ctx.font_size = label_font_size
                 ctx.rgb(0, 0.9, 0).move_to(0, -10).text("All pins reset")
                 ctx.font_size = small_font_size
-                ctx.rgb(0.8, 0.8, 0.8).move_to(0, 15).text("to INPUT")
+                ctx.rgb(0.8, 0.8, 0.8).move_to(0, 15).text("released, hands off")
                 ctx.restore()
                 return
             self.reset_msg_until = None
 
         if self.nav == NAV_PORT:
             ctx.font_size = label_font_size
-            ctx.rgb(1, 1, 1).move_to(0, -55).text("PORT")
-            ctx.rgb(1, 0.8, 0).move_to(0, -20).text(str(self.port))
+            ctx.rgb(1, 1, 1).move_to(0, -72).text("PORT")
+            ctx.rgb(1, 0.8, 0).move_to(0, -42).text(str(self.port))
             ctx.font_size = small_font_size
             if self.hexpansion_name:
-                ctx.rgb(0, 0.9, 0).move_to(0, 10).text(self.hexpansion_name)
-                ctx.rgb(0.8, 0.8, 0.8).move_to(0, 30).text(
+                ctx.rgb(0, 0.9, 0).move_to(0, -14).text(self.hexpansion_name)
+                ctx.rgb(0.8, 0.8, 0.8).move_to(0, 12).text(
                     "VID 0x{:04x}  PID 0x{:04x}".format(self.hexpansion_vid, self.hexpansion_pid))
             else:
-                ctx.rgb(0.6, 0.6, 0.6).move_to(0, 10).text("no hexpansion ID")
+                ctx.rgb(0.6, 0.6, 0.6).move_to(0, -14).text("no hexpansion ID")
+            if self.detect_line is None:
+                ctx.rgb(0.6, 0.6, 0.6).move_to(0, 38).text("detect line: n/a")
+            elif self.detect_line:
+                ctx.rgb(*COLOR_WARN).move_to(0, 38).text("detect line: present")
+            else:
+                ctx.rgb(0.6, 0.6, 0.6).move_to(0, 38).text("detect line: empty")
         elif self.nav == NAV_I2C and self.i2c_show_all:
             # A completely separate, uncluttered layout for the full
             # address list -- U/D toggles here specifically when the
@@ -968,61 +1233,62 @@ class PinTesterApp(app.App):
             i = self.nav
             name, secondary, _kind, _idx = PIN_INFO[i]
             mode = self.pin_modes[i]
-            if mode in LED_FAMILY:
+            if mode == PIN_MODE_INSPECT:
+                colour = COLOR_INSPECT
+            elif mode in LED_FAMILY:
                 colour = COLOR_LED
             else:
                 colour = COLOR_OUTPUT if mode in OUTPUT_FAMILY or mode == PIN_MODE_PWM else COLOR_INPUT
-            title = "{} ({})".format(name, secondary) if secondary else name
+            title = name  # just the HS_F.. label; MOSI/SCK/CS/DC are still accepted as aliases
             ctx.font_size = small_font_size
-            ctx.rgb(*colour).move_to(0, -55).text("Port {}  {}".format(self.port, title))
+            ctx.rgb(*colour).move_to(0, -78).text("Port {}  {}".format(self.port, title))
             if self._hexpansion_present():
-                ctx.rgb(1, 0.7, 0).move_to(0, -42).text("⚠ hexpansion present")
+                ctx.rgb(*COLOR_WARN).move_to(0, -54).text("⚠ hexpansion present")
             mode_text = PIN_MODE_LABELS[mode]
             if self.pin_auto_detected[i]:
                 mode_text += " (auto)"
-            ctx.rgb(1, 0.6, 1).move_to(0, -22).text(mode_text)
+            mode_colour = COLOR_WARN if mode == PIN_MODE_INSPECT else (1, 0.6, 1)
+            ctx.rgb(*mode_colour).move_to(0, -30).text(mode_text)
 
             level = self.live_levels[i]
             hilo_text = "?" if level is None else ("HIGH" if level else "LOW")
             onoff_text = "?" if level is None else ("ON" if level else "OFF")
-            ctx.text_align = ctx.LEFT
-            if mode == PIN_MODE_INPUT:
-                self._draw_status_value(ctx, -60, -5, "status = ", hilo_text, level, colour)
+            if mode == PIN_MODE_INSPECT:
+                lines = self._inspect_lines(i, colour)
+            elif mode == PIN_MODE_INPUT:
+                lines = [("status = ", hilo_text, level, colour)]
             elif mode == PIN_MODE_LATCH:
-                self._draw_status_value(ctx, -60, -5, "status = ", hilo_text, level, colour)
-                ctx.rgb(0.6, 1, 0.6).move_to(-80, 18).text("seen high:{} low:{}".format(self.latch_high[i], self.latch_low[i]))
+                lines = [("status = ", hilo_text, level, colour),
+                         ("seen high:{} low:{}".format(self.latch_high[i], self.latch_low[i]),
+                          "", None, (0.6, 1, 0.6))]
             elif mode in LED_FAMILY:
                 pct = "?" if level is None else "{}%".format(self._pct_from_duty(level))
                 set_pct = "{}%".format(self.led_level[i])
                 if mode == PIN_MODE_LED_BREATHE:
-                    ctx.text_align = ctx.CENTER
-                    ctx.rgb(*colour).move_to(0, -5).text(
-                        "cycle {}  max {}".format(self._fmt_secs(self.led_period[i]), set_pct))
-                    ctx.text_align = ctx.LEFT
-                    self._draw_status_value(ctx, -60, 18, "brightness = ", pct, level, colour)
+                    lines = [("cycle {}  max {}".format(self._fmt_secs(self.led_period[i]), set_pct),
+                              "", None, colour),
+                             ("brightness = ", pct, level, colour)]
                 elif mode == PIN_MODE_LED_ON:
-                    self._draw_status_value(ctx, -60, -5, "brightness = ", set_pct, level, colour)
+                    lines = [("brightness = ", set_pct, level, colour)]
                 else:
                     # OFF: the output is dark, but UP/DOWN still edits the
                     # brightness that LED ON / BREATHE will use -- show it.
-                    ctx.rgb(*colour).move_to(-60, -5).text("brightness = {}".format(set_pct))
-                    self._draw_status_value(ctx, -60, 18, "output = ", "OFF", 0, colour)
+                    lines = [("brightness = {}".format(set_pct), "", None, colour),
+                             ("output = ", "OFF", 0, colour)]
             elif mode == PIN_MODE_PWM:
-                rows = (("freq", self._fmt_freq(PWM_FREQS[self.pwm_freq_idx[i]])),
-                        ("duty", "{}%".format(self.pwm_duty[i])))
-                for n, (label, value) in enumerate(rows):
+                lines = []
+                for n, (label, value) in enumerate((
+                        ("freq", self._fmt_freq(PWM_FREQS[self.pwm_freq_idx[i]])),
+                        ("duty", "{}%".format(self.pwm_duty[i])))):
                     active = n == self.pwm_field[i]
-                    row_colour = (1, 1, 0.3) if active else (0.8, 0.8, 0.8)
-                    ctx.rgb(*row_colour).move_to(-60, -5 + n * 23).text(
-                        "{} {} = {}".format(">" if active else " ", label, value))
+                    lines.append(("{} {} = {}".format(">" if active else " ", label, value),
+                                  "", None, (1, 1, 0.3) if active else (0.8, 0.8, 0.8)))
             elif mode == PIN_MODE_OUTPUT_AUTO:
-                ctx.text_align = ctx.CENTER
-                ctx.rgb(*colour).move_to(0, -5).text("blinking @2Hz")
-                ctx.text_align = ctx.LEFT
-                self._draw_status_value(ctx, -60, 18, "status = ", onoff_text, level, colour)
+                lines = [("blinking @2Hz", "", None, colour),
+                         ("status = ", onoff_text, level, colour)]
             else:
-                self._draw_status_value(ctx, -60, -5, "status = ", onoff_text, level, colour)
-            ctx.text_align = ctx.CENTER
+                lines = [("status = ", onoff_text, level, colour)]
+            self._draw_value_lines(ctx, lines, VALUE_LINES_TOP)
 
         if self.status != "ready":
             ctx.font_size = small_font_size
