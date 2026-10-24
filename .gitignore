@@ -1,0 +1,3 @@
+# Python bytecode caches (created whenever the app is compiled or imported on a computer)
+__pycache__/
+*.pyc
