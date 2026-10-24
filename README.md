@@ -25,6 +25,12 @@ Per-pin modes:
 - **OUTPUT: OFF / ON** -- drive the pin to a fixed level.
 - **OUTPUT: AUTO** -- auto-blink the pin at ~2Hz, so a toggle counter or multimeter on the far
   end of the wire can confirm continuity without needing precise button timing.
+- **LED: OFF / ON / BREATHE** (LS pins only) -- puts the pin in the AW9523B's constant-current
+  LED/PWM mode (`pin.init(pin.PWM)` + `pin.duty(0-255)`) for testing an LED wired to the pin.
+  UP/DOWN sets the brightness in 1% steps in OFF/ON (the set value is shown even while OFF);
+  in BREATHE it fades up and down to that brightness and UP/DOWN sets the cycle time in 0.1s
+  steps (0.2s to 10.0s). F (short press) cycles
+  OFF -> ON -> BREATHE. Not available on HS pins (plain ESP32 GPIOs).
 
 Tiles (reached with LEFT/RIGHT, wrapping): **STATUS** (every pin's live value at once,
 colour-coded input/output), **PORT** (pick which hexpansion port, 1-6 -- also shows the
@@ -33,6 +39,13 @@ both the `0x50` and `0x57` EEPROM addresses since larger EEPROMs use the latter)
 (scans the port's I2C bus for a real device, and reports whether the system has an EEPROM
 filesystem mounted there -- file count, and whether an app is available), then each pin in
 turn.
+
+- **PWM** (HS pins only) -- real ESP32 hardware PWM on the pin, 10 Hz to 100 kHz in 1-2-5 steps
+  and duty 0-100% in 1% steps (the firmware can't generate below 10 Hz). CONFIRM cycles
+  INPUT -> OUTPUT -> PWM, F switches between editing frequency and duty, UP/DOWN changes the
+  field being edited (auto-repeating while held). Starts at 1 kHz / 50%. Each pin keeps its own
+  PWM settings and runs independently. The LS pins can't do this (the expander only has
+  fixed-frequency LED dimming) -- use their LED modes instead.
 
 ### Hexpansion safety
 
@@ -59,9 +72,9 @@ Works on any badge/frontboard:
 | UP / DOWN (on PORT or STATUS tile) | Change the hexpansion port (1-6) -- resets every pin to INPUT, since it's a different physical connector |
 | UP / DOWN (on I2C tile) | Toggle between the compact address list and a full-list view (when there are more addresses than fit compactly) |
 | CONFIRM (on STATUS tile) | Toggle "Remote: ON/OFF" (see below) |
-| CONFIRM (on a pin tile) | Switch that pin between its INPUT family (INPUT/LATCHED) and OUTPUT family (OFF/ON/AUTO) |
-| UP / DOWN (on a pin tile) | Within INPUT family: toggle INPUT <-> LATCHED. Within OUTPUT family: cycle OFF -> ON -> AUTO |
-| CANCEL, short press | Reset the current pin's LATCHED indicator |
+| CONFIRM (on a pin tile) | Switch that pin between its INPUT family (INPUT/LATCHED) and OUTPUT family (OFF/ON/AUTO) and, on LS pins, LED family (CONFIRM cycles INPUT -> OUTPUT -> LED) |
+| UP / DOWN (on a pin tile) | Within INPUT family: toggle INPUT <-> LATCHED. Within OUTPUT family: cycle OFF -> ON -> AUTO. Within LED family: brightness (OFF/ON) or breathe cycle time. F short press cycles LED OFF/ON/BREATHE |
+| CANCEL, short press | On the STATUS tile: reset every pin on the port to its safe INPUT default (also clears LED and PWM settings) -- the first press only asks "Reset all pins?", press F again within 3s to confirm, any other button cancels. On a pin tile: reset that pin's LATCHED indicator (or cycle LED OFF/ON/BREATHE in an LED mode) |
 | CANCEL, held | Exit the app |
 
 Joystick bonus (2026 frontboard only -- harmless no-ops on other hardware):
@@ -119,6 +132,8 @@ Commands, one per line:
 - `STATUS` -- every pin's `name=level`
 - `GET <pin>` -- one pin's current level
 - `SET <pin> IN|LATCH|OFF|ON|AUTO` -- change a pin's mode
+- `SET <pin> PWM [hz [duty]]` -- HS pins only
+- `SET <pin> LEDOFF|LEDON|BREATHE [n]` -- LED modes, LS_A..LS_E only; optional `n` is brightness 0-100 (LEDON) or cycle time in 0.1s units, 2-100 (BREATHE)
 
 This only has any effect while "Remote: ON" is showing on the STATUS tile -- otherwise
 incoming commands are silently ignored, so a pin can never change remotely by surprise.

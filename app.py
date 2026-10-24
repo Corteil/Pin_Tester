@@ -21,7 +21,12 @@
 # the response back. Commands, one per line:
 #   STATUS                          -- every pin's name=level
 #   GET <pin>                       -- one pin's current level
-#   SET <pin> IN|LATCH|OFF|ON|AUTO  -- change a pin's mode
+#   SET <pin> IN|LATCH|OFF|ON|AUTO      -- change a pin's mode
+#   SET <pin> PWM [hz [duty]]           -- HS pins only: hardware PWM
+#   SET <pin> LEDOFF|LEDON|BREATHE [n]  -- LED modes, LS_A..LS_E only; n is
+#                                          brightness 0-100 (LEDON) or
+#                                          cycle time in 0.1s units, 2-100
+#                                          (BREATHE)
 # This only has any effect while "Remote: ON" is showing on the STATUS
 # tile -- otherwise incoming commands are ignored entirely, so pins can
 # never change remotely by surprise.
@@ -48,10 +53,28 @@
 #                  pin_control call -- has no other effect on its own).
 #   On a pin tile:
 #     CONFIRM   -- switch the pin between its INPUT family (FOLLOW/
-#                  LATCHED) and its OUTPUT family (OFF/ON/AUTO).
+#                  LATCHED), its OUTPUT family (OFF/ON/AUTO) and, on LS
+#                  pins, its LED family.
 #     UP/DOWN   -- within INPUT family: toggle FOLLOW <-> LATCHED.
 #                  within OUTPUT family: cycle OFF -> ON -> AUTO -> OFF.
-#   CANCEL (F)  -- short press: reset the current pin's LATCHED indicator.
+#                  within LED family: change brightness (LED OFF/ON) or
+#                  breathe cycle time (BREATHE).
+#     LS pins also have a third family, LED (the AW9523B's constant-current
+#     LED/PWM mode, for testing an LED wired to the pin): CONFIRM cycles
+#     INPUT -> OUTPUT -> LED -> INPUT, and F (short press) cycles
+#     LED OFF -> LED ON -> BREATHE. In the LED modes UP/DOWN auto-repeats
+#     while held (after a short delay, faster the longer it's held).
+#   HS pins have a third family too, PWM (real ESP32 hardware PWM, 10Hz to
+#   100kHz): CONFIRM cycles INPUT -> OUTPUT -> PWM -> INPUT, F (short
+#   press) switches between editing frequency and duty, and UP/DOWN
+#   changes the field being edited (auto-repeating while held). Each pin
+#   keeps its own PWM running independently, like every other mode.
+#   CANCEL (F)  -- short press: on the STATUS tile, reset (press twice to
+#                  confirm -- the first press only arms it) every pin on the
+#                  port to its safe INPUT default (also clears LED
+#                  brightness/cycle-time settings); on a pin tile, reset the
+#                  current pin's LATCHED indicator
+#                  (or, in an LED mode, cycle LED OFF/ON/BREATHE).
 #                  Long press (>= LONG_PRESS_MS): exit the app.
 #                  (F is CANCEL's physical button on this badge's own hex
 #                  layout -- see frontboards/twentysix.py's own BUTTONS
@@ -74,6 +97,10 @@ try:
     import uselect as select
 except ImportError:
     import select
+try:
+    from machine import PWM
+except ImportError:
+    PWM = None
 from events.input import Buttons, BUTTON_TYPES
 from app_components.tokens import clear_background, small_font_size, label_font_size
 from system.hexpansion.config import HexpansionConfig
@@ -113,15 +140,44 @@ PIN_MODE_LATCH = 1    # LATCHED
 PIN_MODE_OUTPUT_OFF = 2
 PIN_MODE_OUTPUT_ON = 3
 PIN_MODE_OUTPUT_AUTO = 4
-PIN_MODE_LABELS = ("INPUT", "LATCHED", "OUTPUT: OFF", "OUTPUT: ON", "OUTPUT: AUTO")
+PIN_MODE_LED_OFF = 5  # LS pins only: AW9523B LED (PWM) mode
+PIN_MODE_LED_ON = 6
+PIN_MODE_LED_BREATHE = 7
+PIN_MODE_PWM = 8      # HS pins only: ESP32 hardware PWM
+PIN_MODE_LABELS = ("INPUT", "LATCHED", "OUTPUT: OFF", "OUTPUT: ON", "OUTPUT: AUTO",
+                   "LED: OFF", "LED: ON", "LED: BREATHE", "PWM")
 INPUT_FAMILY = (PIN_MODE_INPUT, PIN_MODE_LATCH)
 OUTPUT_FAMILY = (PIN_MODE_OUTPUT_OFF, PIN_MODE_OUTPUT_ON, PIN_MODE_OUTPUT_AUTO)
+LED_FAMILY = (PIN_MODE_LED_OFF, PIN_MODE_LED_ON, PIN_MODE_LED_BREATHE)
 
 COLOR_INPUT = (0, 1, 1)      # cyan
 COLOR_OUTPUT = (1, 0.55, 0)  # orange
+COLOR_LED = (1, 1, 0.3)      # yellow
 
 BLINK_PERIOD_MS = 250  # ~2Hz full cycle
 LONG_PRESS_MS = 600
+# PWM mode: HS pins only (real ESP32 LEDC hardware PWM). The firmware
+# can't go below 10Hz (ESP_ERR_INVALID_ARG / EPERM from 8Hz down), and
+# duty_u16()'s getter always reads back 0, so the app tracks the values itself.
+PWM_FREQS = (10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000)
+PWM_DEFAULT_FREQ_IDX = 6   # 1kHz
+PWM_DEFAULT_DUTY = 50      # percent
+PWM_FIELD_FREQ = 0
+PWM_FIELD_DUTY = 1
+# Hold-to-repeat for UP/DOWN in the LED modes.
+RESET_CONFIRM_MS = 3000  # window for the second F press that confirms a pin reset
+HINT_FONT_SCALE = 0.8  # bottom hint lines are drawn smaller than normal text
+HOLD_DELAY_MS = 400    # held this long before repeating starts
+HOLD_REPEAT_MS = 100   # step interval while repeating
+HOLD_ACCEL_MS = 1500   # held this long, repeat speeds up
+HOLD_REPEAT_FAST_MS = 40
+LED_DEFAULT_LEVEL = 50   # brightness setting, percent (0-100), 1% per UP/DOWN
+# Breathe cycle time (one full fade up + down), 0.1s per UP/DOWN.
+LED_PERIOD_MIN_MS = 200
+LED_PERIOD_MAX_MS = 10000
+LED_PERIOD_STEP_MS = 100
+LED_DEFAULT_PERIOD_MS = 2000
+LED_WRITE_QUANT = 8    # quantise breathe duty so we don't flood the I2C expander
 
 
 class PinTesterApp(app.App):
@@ -134,6 +190,12 @@ class PinTesterApp(app.App):
         self.status = ""
         self.cancel_press_start = None
         self.cancel_exit_triggered = False
+        self.reset_msg_until = None
+        self.reset_armed_until = None
+        self.hold_dir = 0
+        self.hold_key = None
+        self.hold_start = 0
+        self.hold_last = 0
         self.blink_state = False
         self.last_blink_ms = time.ticks_ms()
         self.i2c_scan_result = None
@@ -167,6 +229,7 @@ class PinTesterApp(app.App):
         # the references -- used both at startup and on port change (a
         # different physical connector's 9 pins, so nothing should keep
         # driving from the old port).
+        self._pwm_stop_all()
         for p in getattr(self, "pin_objs", []):
             if p is not None:
                 try:
@@ -179,6 +242,12 @@ class PinTesterApp(app.App):
         self.latch_low = [False] * NUM_PINS
         self.live_levels = [None] * NUM_PINS
         self.pin_auto_detected = [False] * NUM_PINS
+        self.led_level = [LED_DEFAULT_LEVEL] * NUM_PINS
+        self.led_period = [LED_DEFAULT_PERIOD_MS] * NUM_PINS
+        self.pwm_objs = [None] * NUM_PINS
+        self.pwm_freq_idx = [PWM_DEFAULT_FREQ_IDX] * NUM_PINS
+        self.pwm_duty = [PWM_DEFAULT_DUTY] * NUM_PINS
+        self.pwm_field = [PWM_FIELD_FREQ] * NUM_PINS
 
     def _scan_i2c(self):
         # The hexpansion I2C bus isn't a per-port dedicated GPIO pair the
@@ -284,6 +353,7 @@ class PinTesterApp(app.App):
         self.status = "ready"
 
     def _apply_mode(self, i, mode):
+        self._pwm_stop(i)  # release any running PWM before reconfiguring
         self.pin_modes[i] = mode
         self.latch_high[i] = False
         self.latch_low[i] = False
@@ -298,6 +368,19 @@ class PinTesterApp(app.App):
             elif mode == PIN_MODE_OUTPUT_AUTO:
                 pin.init(pin.OUT)
                 pin.value(1 if self.blink_state else 0)
+            elif mode == PIN_MODE_PWM:
+                if PIN_INFO[i][2] != "hs" or PWM is None:
+                    raise ValueError("PWM mode is HS pins only")
+                self.pwm_objs[i] = PWM(
+                    pin, freq=PWM_FREQS[self.pwm_freq_idx[i]],
+                    duty_u16=self.pwm_duty[i] * 65535 // 100)
+                self.live_levels[i] = self.pwm_duty[i]
+            elif mode in LED_FAMILY:
+                if PIN_INFO[i][2] != "ls":
+                    raise ValueError("LED mode is LS pins only")
+                pin.init(pin.PWM)
+                pin.duty(0)
+                self.live_levels[i] = 0
             else:  # INPUT (FOLLOW) or LATCH (LATCHED)
                 pin.init(pin.IN)
             self.pin_objs[i] = pin
@@ -305,6 +388,118 @@ class PinTesterApp(app.App):
         except Exception as e:
             self.status = "pin error: {!r}".format(e)
             self.pin_objs[i] = None
+
+    def _led_breathe_duty(self, i):
+        # Triangle wave 0..led_level..0 over the pin's cycle time.
+        period = self.led_period[i]
+        half = period // 2
+        t = time.ticks_ms() % period
+        d = t if t < half else period - t
+        peak = self._duty_from_pct(self.led_level[i])
+        return (d * peak // half) // LED_WRITE_QUANT * LED_WRITE_QUANT
+
+    @staticmethod
+    def _duty_from_pct(pct):
+        return pct * 255 // 100
+
+    @staticmethod
+    def _pct_from_duty(duty):
+        return (duty * 100 + 127) // 255
+
+    @staticmethod
+    def _fmt_secs(ms):
+        return "{}.{}s".format(ms // 1000, ms % 1000 // 100)
+
+    def _led_target(self, i):
+        mode = self.pin_modes[i]
+        if mode == PIN_MODE_LED_OFF:
+            return 0
+        if mode == PIN_MODE_LED_ON:
+            return self._duty_from_pct(self.led_level[i])
+        return self._led_breathe_duty(i)
+
+    def _led_adjust(self, i, direction):
+        # UP/DOWN in an LED mode: cycle time while breathing, brightness otherwise.
+        if self.pin_modes[i] == PIN_MODE_LED_BREATHE:
+            self.led_period[i] = max(LED_PERIOD_MIN_MS, min(
+                LED_PERIOD_MAX_MS, self.led_period[i] + direction * LED_PERIOD_STEP_MS))
+        else:
+            self.led_level[i] = max(0, min(100, self.led_level[i] + direction))
+
+    def _hold_repeat(self, key, up_pressed, down_pressed, adjust):
+        # Buttons.pressed() only fires once per press (the first step is
+        # taken by the normal UP/DOWN handler), so repeating while held
+        # polls Buttons.get() for the held state instead. key identifies
+        # what's being adjusted (pin index) so switching tiles
+        # mid-hold cancels the repeat.
+        now = time.ticks_ms()
+        if up_pressed or down_pressed:
+            self.hold_dir = 1 if up_pressed else -1
+            self.hold_key = key
+            self.hold_start = now
+            self.hold_last = now
+            return
+        if self.hold_dir == 0:
+            return
+        button = "UP" if self.hold_dir > 0 else "DOWN"
+        if self.hold_key != key or not self.buttons.get(BUTTON_TYPES[button]):
+            self.hold_dir = 0
+            return
+        held = time.ticks_diff(now, self.hold_start)
+        interval = HOLD_REPEAT_FAST_MS if held >= HOLD_ACCEL_MS else HOLD_REPEAT_MS
+        if held >= HOLD_DELAY_MS and time.ticks_diff(now, self.hold_last) >= interval:
+            self.hold_last = now
+            adjust(self.hold_dir)
+
+    # --- PWM mode (HS pins) ---------------------------------------------
+
+    @staticmethod
+    def _fmt_freq(hz):
+        if hz >= 1000:
+            return "{} kHz".format(hz // 1000)
+        return "{} Hz".format(hz)
+
+    def _pwm_stop(self, i):
+        # Deinit pin i's PWM, if running. Callers (_apply_mode) re-init the
+        # pin for whatever mode comes next.
+        if self.pwm_objs[i] is not None:
+            try:
+                self.pwm_objs[i].deinit()
+            except Exception:
+                pass
+            self.pwm_objs[i] = None
+
+    def _pwm_stop_all(self):
+        for p in getattr(self, "pwm_objs", []):
+            if p is not None:
+                try:
+                    p.deinit()
+                except Exception:
+                    pass
+
+    def _pwm_adjust(self, i, direction):
+        if self.pwm_field[i] == PWM_FIELD_FREQ:
+            self.pwm_freq_idx[i] = max(0, min(len(PWM_FREQS) - 1, self.pwm_freq_idx[i] + direction))
+        else:
+            self.pwm_duty[i] = max(0, min(100, self.pwm_duty[i] + direction))
+        try:
+            self.pwm_objs[i].freq(PWM_FREQS[self.pwm_freq_idx[i]])
+            self.pwm_objs[i].duty_u16(self.pwm_duty[i] * 65535 // 100)
+            self.live_levels[i] = self.pwm_duty[i]
+        except Exception as e:
+            self.status = "pwm error: {!r}".format(e)
+            self._apply_mode(i, PIN_MODE_INPUT)
+
+    def _adjust_mode_value(self, i, direction):
+        # UP/DOWN auto-repeat target for the LED and PWM modes.
+        if self.pin_modes[i] == PIN_MODE_PWM:
+            self._pwm_adjust(i, direction)
+        else:
+            self._led_adjust(i, direction)
+
+    def _cycle_led_mode(self, i):
+        idx = LED_FAMILY.index(self.pin_modes[i])
+        self._apply_mode(i, LED_FAMILY[(idx + 1) % len(LED_FAMILY)])
 
     def _ensure_pin(self, i):
         if self.pin_objs[i] is None:
@@ -338,13 +533,18 @@ class PinTesterApp(app.App):
         # involved at all (see remote_poll's own setup comment):
         #   STATUS                 -- print every pin's name=level
         #   GET <pin>               -- print one pin's current level
-        #   SET <pin> IN|LATCH|OFF|ON|AUTO  -- change a pin's mode
+        #   SET <pin> IN|LATCH|OFF|ON|AUTO|LEDOFF|LEDON|BREATHE [n]
+        #                           -- change a pin's mode (see module docstring)
         MODE_WORDS = {
             "IN": PIN_MODE_INPUT,
             "LATCH": PIN_MODE_LATCH,
             "OFF": PIN_MODE_OUTPUT_OFF,
             "ON": PIN_MODE_OUTPUT_ON,
             "AUTO": PIN_MODE_OUTPUT_AUTO,
+            "LEDOFF": PIN_MODE_LED_OFF,
+            "LEDON": PIN_MODE_LED_ON,
+            "BREATHE": PIN_MODE_LED_BREATHE,
+            "PWM": PIN_MODE_PWM,
         }
         parts = line.split()
         if not parts:
@@ -368,7 +568,25 @@ class PinTesterApp(app.App):
                     print("ERR unknown pin {}".format(parts[1]))
                 elif mode_word not in MODE_WORDS:
                     print("ERR unknown mode {}".format(mode_word))
+                elif MODE_WORDS[mode_word] in LED_FAMILY and PIN_INFO[i][2] != "ls":
+                    print("ERR LED mode is LS pins only")
+                elif mode_word == "PWM" and PIN_INFO[i][2] != "hs":
+                    print("ERR PWM mode is HS pins only")
                 else:
+                    if len(parts) >= 4:
+                        n = int(parts[3])
+                        if mode_word == "LEDON":
+                            self.led_level[i] = max(0, min(100, n))
+                        elif mode_word == "PWM":
+                            # n = frequency in Hz (snapped to the nearest
+                            # step), optional 5th field = duty percent
+                            self.pwm_freq_idx[i] = min(
+                                range(len(PWM_FREQS)), key=lambda k: abs(PWM_FREQS[k] - n))
+                            if len(parts) >= 5:
+                                self.pwm_duty[i] = max(0, min(100, int(parts[4])))
+                        elif mode_word == "BREATHE":
+                            self.led_period[i] = max(LED_PERIOD_MIN_MS, min(
+                                LED_PERIOD_MAX_MS, n * 100))
                     self._apply_mode(i, MODE_WORDS[mode_word])
                     print("OK {} {}".format(parts[1], mode_word))
             else:
@@ -412,7 +630,24 @@ class PinTesterApp(app.App):
                 return True
         else:
             if self.cancel_press_start is not None and not self.cancel_exit_triggered:
-                self._reset_current_latch()
+                if self.nav == NAV_STATUS:
+                    # Safety catch: the first press only arms the reset,
+                    # a second press within RESET_CONFIRM_MS carries it out.
+                    now = time.ticks_ms()
+                    if (self.reset_armed_until is not None
+                            and time.ticks_diff(self.reset_armed_until, now) > 0):
+                        self.reset_armed_until = None
+                        self._reset_all_pins()
+                        self.status = "ready"
+                        self.reset_msg_until = time.ticks_add(now, 2000)
+                    else:
+                        self.reset_armed_until = time.ticks_add(now, RESET_CONFIRM_MS)
+                elif 0 <= self.nav < NUM_PINS and self.pin_modes[self.nav] == PIN_MODE_PWM:
+                    self.pwm_field[self.nav] = 1 - self.pwm_field[self.nav]
+                elif 0 <= self.nav < NUM_PINS and self.pin_modes[self.nav] in LED_FAMILY:
+                    self._cycle_led_mode(self.nav)
+                else:
+                    self._reset_current_latch()
             self.cancel_press_start = None
             self.cancel_exit_triggered = False
 
@@ -424,6 +659,9 @@ class PinTesterApp(app.App):
             self.nav += 1
             if self.nav > NUM_PINS - 1:
                 self.nav = NAV_STATUS
+
+        if self.nav != NAV_STATUS:
+            self.reset_armed_until = None
 
         if self.nav == NAV_PORT:
             if self.buttons.pressed(BUTTON_TYPES["UP"]):
@@ -454,39 +692,51 @@ class PinTesterApp(app.App):
                 self._scan_i2c()
         elif self.nav == NAV_STATUS:
             if self.buttons.pressed(BUTTON_TYPES["CONFIRM"]):
+                self.reset_armed_until = None
                 self.remote_active = not self.remote_active
             elif self.buttons.pressed(BUTTON_TYPES["UP"]):
+                self.reset_armed_until = None
                 self.port = self.port % 6 + 1
                 self._reset_all_pins()
                 self._scan_i2c()
                 self.i2c_show_all = False
             elif self.buttons.pressed(BUTTON_TYPES["DOWN"]):
+                self.reset_armed_until = None
                 self.port = (self.port - 2) % 6 + 1
                 self._reset_all_pins()
                 self._scan_i2c()
                 self.i2c_show_all = False
         else:
             i = self.nav
+            # pressed() is edge-triggered and consumes the event, so read
+            # each button exactly once per frame.
+            up_pressed = self.buttons.pressed(BUTTON_TYPES["UP"])
+            down_pressed = self.buttons.pressed(BUTTON_TYPES["DOWN"])
             if self.buttons.pressed(BUTTON_TYPES["CONFIRM"]):
-                # Switch between this pin's INPUT family and OUTPUT family.
+                # Cycle this pin's family: INPUT -> OUTPUT -> LED (LS pins)
+                # or PWM (HS pins) -> INPUT.
                 if self.pin_modes[i] in INPUT_FAMILY:
                     self._apply_mode(i, PIN_MODE_OUTPUT_OFF)
+                elif self.pin_modes[i] in OUTPUT_FAMILY:
+                    self._apply_mode(i, PIN_MODE_LED_OFF if PIN_INFO[i][2] == "ls" else PIN_MODE_PWM)
                 else:
                     self._apply_mode(i, PIN_MODE_INPUT)
-            elif self.buttons.pressed(BUTTON_TYPES["UP"]):
+            elif up_pressed or down_pressed:
+                direction = 1 if up_pressed else -1
                 if self.pin_modes[i] in INPUT_FAMILY:
                     other = PIN_MODE_LATCH if self.pin_modes[i] == PIN_MODE_INPUT else PIN_MODE_INPUT
                     self._apply_mode(i, other)
+                elif self.pin_modes[i] in LED_FAMILY:
+                    self._led_adjust(i, direction)
+                elif self.pin_modes[i] == PIN_MODE_PWM:
+                    self._pwm_adjust(i, direction)
                 else:
                     idx = OUTPUT_FAMILY.index(self.pin_modes[i])
-                    self._apply_mode(i, OUTPUT_FAMILY[(idx + 1) % len(OUTPUT_FAMILY)])
-            elif self.buttons.pressed(BUTTON_TYPES["DOWN"]):
-                if self.pin_modes[i] in INPUT_FAMILY:
-                    other = PIN_MODE_LATCH if self.pin_modes[i] == PIN_MODE_INPUT else PIN_MODE_INPUT
-                    self._apply_mode(i, other)
-                else:
-                    idx = OUTPUT_FAMILY.index(self.pin_modes[i])
-                    self._apply_mode(i, OUTPUT_FAMILY[(idx - 1) % len(OUTPUT_FAMILY)])
+                    self._apply_mode(i, OUTPUT_FAMILY[(idx + direction) % len(OUTPUT_FAMILY)])
+            if self.pin_modes[i] in LED_FAMILY or self.pin_modes[i] == PIN_MODE_PWM:
+                self._hold_repeat(i, up_pressed, down_pressed, lambda d: self._adjust_mode_value(i, d))
+            else:
+                self.hold_dir = 0
 
         # Joystick bonus shortcuts (2026 frontboard) -- harmless no-ops if
         # a joystick isn't actually present, since the events just never fire.
@@ -525,6 +775,19 @@ class PinTesterApp(app.App):
                     self.status = "read error: {!r}".format(e)
             elif mode in (PIN_MODE_OUTPUT_OFF, PIN_MODE_OUTPUT_ON):
                 self.live_levels[i] = 0 if mode == PIN_MODE_OUTPUT_OFF else 1
+            elif mode == PIN_MODE_PWM:
+                self.live_levels[i] = self.pwm_duty[i]
+            elif mode in LED_FAMILY:
+                pin = self._ensure_pin(i)
+                if pin is None:
+                    continue
+                duty = self._led_target(i)
+                if duty != self.live_levels[i]:
+                    try:
+                        pin.duty(duty)
+                        self.live_levels[i] = duty
+                    except Exception as e:
+                        self.status = "write error: {!r}".format(e)
             elif mode == PIN_MODE_OUTPUT_AUTO and blink_tick:
                 pin = self._ensure_pin(i)
                 if pin is None:
@@ -578,11 +841,18 @@ class PinTesterApp(app.App):
             is_output = self.pin_modes[i] in OUTPUT_FAMILY
             if level is None:
                 level_text = "?"
+            elif self.pin_modes[i] in LED_FAMILY:
+                level_text = "{}%".format(self._pct_from_duty(level))
+            elif self.pin_modes[i] == PIN_MODE_PWM:
+                level_text = "{}%".format(level)
             elif is_output:
                 level_text = "ON" if level else "OFF"
             else:
                 level_text = "HIGH" if level else "LOW"
-            colour = COLOR_OUTPUT if is_output else COLOR_INPUT
+            if self.pin_modes[i] in LED_FAMILY:
+                colour = COLOR_LED
+            else:
+                colour = COLOR_OUTPUT if is_output or self.pin_modes[i] == PIN_MODE_PWM else COLOR_INPUT
             if self.pin_auto_detected[i]:
                 level_text += "*"  # auto-detected as actively driven on hexpansion insertion
             self._draw_status_value(ctx, x, y, "{}: ".format(name), level_text, level, colour)
@@ -594,7 +864,14 @@ class PinTesterApp(app.App):
         if self.nav == NAV_I2C:
             return "U/D: back" if self.i2c_show_all else "U/D: show all"
         if self.nav == NAV_STATUS:
-            return "C: remote"
+            return "C:remote F:reset"
+        mode = self.pin_modes[self.nav]
+        if mode == PIN_MODE_LED_BREATHE:
+            return "U/D:time F:mode C:swap"
+        if mode in LED_FAMILY:
+            return "U/D:val F:mode C:swap"
+        if mode == PIN_MODE_PWM:
+            return "U/D:val F:field C:swap"
         return "U/D:mode C:swap"
 
     def draw(self, ctx):
@@ -602,6 +879,29 @@ class PinTesterApp(app.App):
         clear_background(ctx)
         ctx.text_align = ctx.CENTER
         ctx.text_baseline = ctx.MIDDLE
+
+        # Pin-reset confirmation: shown on an otherwise blank display so it
+        # doesn't overlap the pin grid underneath.
+        if self.reset_armed_until is not None and self.nav == NAV_STATUS:
+            if time.ticks_diff(self.reset_armed_until, time.ticks_ms()) > 0:
+                ctx.font_size = label_font_size
+                ctx.rgb(1, 0.6, 0.2).move_to(0, -25).text("Reset all pins?")
+                ctx.font_size = small_font_size
+                ctx.rgb(1, 1, 1).move_to(0, 5).text("Press F again to confirm")
+                ctx.rgb(0.6, 0.6, 0.6).move_to(0, 28).text("any other button cancels")
+                ctx.restore()
+                return
+            self.reset_armed_until = None
+
+        if self.reset_msg_until is not None and self.nav == NAV_STATUS:
+            if time.ticks_diff(self.reset_msg_until, time.ticks_ms()) > 0:
+                ctx.font_size = label_font_size
+                ctx.rgb(0, 0.9, 0).move_to(0, -10).text("All pins reset")
+                ctx.font_size = small_font_size
+                ctx.rgb(0.8, 0.8, 0.8).move_to(0, 15).text("to INPUT")
+                ctx.restore()
+                return
+            self.reset_msg_until = None
 
         if self.nav == NAV_PORT:
             ctx.font_size = label_font_size
@@ -668,7 +968,10 @@ class PinTesterApp(app.App):
             i = self.nav
             name, secondary, _kind, _idx = PIN_INFO[i]
             mode = self.pin_modes[i]
-            colour = COLOR_OUTPUT if mode in OUTPUT_FAMILY else COLOR_INPUT
+            if mode in LED_FAMILY:
+                colour = COLOR_LED
+            else:
+                colour = COLOR_OUTPUT if mode in OUTPUT_FAMILY or mode == PIN_MODE_PWM else COLOR_INPUT
             title = "{} ({})".format(name, secondary) if secondary else name
             ctx.font_size = small_font_size
             ctx.rgb(*colour).move_to(0, -55).text("Port {}  {}".format(self.port, title))
@@ -688,6 +991,30 @@ class PinTesterApp(app.App):
             elif mode == PIN_MODE_LATCH:
                 self._draw_status_value(ctx, -60, -5, "status = ", hilo_text, level, colour)
                 ctx.rgb(0.6, 1, 0.6).move_to(-80, 18).text("seen high:{} low:{}".format(self.latch_high[i], self.latch_low[i]))
+            elif mode in LED_FAMILY:
+                pct = "?" if level is None else "{}%".format(self._pct_from_duty(level))
+                set_pct = "{}%".format(self.led_level[i])
+                if mode == PIN_MODE_LED_BREATHE:
+                    ctx.text_align = ctx.CENTER
+                    ctx.rgb(*colour).move_to(0, -5).text(
+                        "cycle {}  max {}".format(self._fmt_secs(self.led_period[i]), set_pct))
+                    ctx.text_align = ctx.LEFT
+                    self._draw_status_value(ctx, -60, 18, "brightness = ", pct, level, colour)
+                elif mode == PIN_MODE_LED_ON:
+                    self._draw_status_value(ctx, -60, -5, "brightness = ", set_pct, level, colour)
+                else:
+                    # OFF: the output is dark, but UP/DOWN still edits the
+                    # brightness that LED ON / BREATHE will use -- show it.
+                    ctx.rgb(*colour).move_to(-60, -5).text("brightness = {}".format(set_pct))
+                    self._draw_status_value(ctx, -60, 18, "output = ", "OFF", 0, colour)
+            elif mode == PIN_MODE_PWM:
+                rows = (("freq", self._fmt_freq(PWM_FREQS[self.pwm_freq_idx[i]])),
+                        ("duty", "{}%".format(self.pwm_duty[i])))
+                for n, (label, value) in enumerate(rows):
+                    active = n == self.pwm_field[i]
+                    row_colour = (1, 1, 0.3) if active else (0.8, 0.8, 0.8)
+                    ctx.rgb(*row_colour).move_to(-60, -5 + n * 23).text(
+                        "{} {} = {}".format(">" if active else " ", label, value))
             elif mode == PIN_MODE_OUTPUT_AUTO:
                 ctx.text_align = ctx.CENTER
                 ctx.rgb(*colour).move_to(0, -5).text("blinking @2Hz")
@@ -701,12 +1028,14 @@ class PinTesterApp(app.App):
             ctx.font_size = small_font_size
             ctx.rgb(1, 0.4, 0.4).move_to(0, 52).text(self.status)
 
-        ctx.font_size = small_font_size
-        ctx.rgb(0.6, 0.6, 0.6).move_to(0, 68).text(self._hint_text())
-        ctx.rgb(0.6, 0.6, 0.6).move_to(0, 88).text("L/R:tile  hold F:exit")
+        ctx.font_size = small_font_size * HINT_FONT_SCALE
+        hint_dy = 4 if self.nav == NAV_STATUS else 0  # STATUS hints sit 4px lower
+        ctx.rgb(0.6, 0.6, 0.6).move_to(0, 68 + hint_dy).text(self._hint_text())
+        ctx.rgb(0.6, 0.6, 0.6).move_to(0, 88 + hint_dy).text("L/R:tile  hold F:exit")
         ctx.restore()
 
     def deinit(self):
+        self._pwm_stop_all()
         for p in self.pin_objs:
             if p is not None:
                 try:

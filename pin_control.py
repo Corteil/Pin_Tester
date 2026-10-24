@@ -145,3 +145,25 @@ def latch(port, name, duration_ms=3000, poll_ms=2):
             ever_low = True
         time.sleep_ms(poll_ms)
     return {"ever_high": ever_high, "ever_low": ever_low, "final": pin.value()}
+
+
+def led(port, name, duration_ms=4000, period_ms=2000):
+    """Fade one LS pin up and down in the AW9523B's LED (PWM) mode for a
+    fixed duration, blocking, then release it back to input. LS pins only
+    -- HS pins have no LED driver. USB/REPL equivalent of the app's
+    LED: BREATHE mode."""
+    primary = next((p for p, s, _k, _i in PIN_INFO if name.upper() in (p, s)), None)
+    kind = next((k for p, _s, k, _i in PIN_INFO if p == primary), None)
+    if kind != "ls":
+        raise ValueError("LED mode is LS pins only, got {!r}".format(name))
+    pin = _resolve(port, name)
+    pin.init(pin.PWM)
+    half = period_ms // 2
+    end = time.ticks_add(time.ticks_ms(), duration_ms)
+    while time.ticks_diff(end, time.ticks_ms()) > 0:
+        t = time.ticks_ms() % period_ms
+        d = t if t < half else period_ms - t
+        pin.duty(d * 255 // half)
+        time.sleep_ms(20)
+    pin.duty(0)
+    pin.init(pin.IN)
