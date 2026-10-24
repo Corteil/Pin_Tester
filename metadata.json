@@ -2,6 +2,6 @@
     "name": "Pin Tester",
     "category": "Apps",
     "author": "Corteil",
-    "description": "Drive or read individual hexpansion port pins to check wiring continuity.",
+    "description": "Check hexpansion pin wiring: inspect, read, drive, PWM, LED, analog. Companion app: github.com/Corteil/Pin_Tester_Companion",
     "version": "5"
 }
