@@ -44,8 +44,15 @@ Per-pin modes:
   and/or LOW since you last reset it -- catches a brief pulse you'd otherwise have to be
   watching at exactly the right moment to see.
 - **OUTPUT: OFF / ON** -- drive the pin to a fixed level.
-- **OUTPUT: AUTO** -- auto-blink the pin at ~2Hz, so a toggle counter or multimeter on the far
-  end of the wire can confirm continuity without needing precise button timing.
+- **OUTPUT: AUTO** -- auto-blink the pin so a toggle counter or multimeter on the far end of the wire
+  can confirm continuity without needing precise button timing. Defaults to ~2Hz (250 ms high,
+  250 ms low). Set the high and low times per pin on the badge -- **F** picks high or low (marked
+  `>`), **UP/DOWN** change it (10 ms a press; holding for a second or more speeds up; limited to
+  250 ms - 10 s) -- or remotely from the companion app / `SET <pin> AUTO <hi_ms> <lo_ms>`. While in
+  AUTO, UP/DOWN edit the times instead of cycling modes; CONFIRM moves on to the next family. Timing comes from the clock (not from counting screen frames),
+  but the badge's screen redraw blocks everything for most of each ~180 ms frame, so it's only
+  accurate from about 250 ms per phase (measured: 250/250 ms hits 99-102% of the expected edges,
+  100/100 ms 0-21%, 20/20 ms 11-14%). For fast square waves on an HS pin use PWM mode.
 - **ANALOG IN** (HS pins on ports 4, 5 and 6 only) -- reads the pin's voltage with the ESP32-S3
   ADC (about 0-3.1 V; shows volts, the raw reading and a bar). Ports 1-3 have no ADC pins and the
   LS pins can't do analog. It's the step after PWM in the CONFIRM cycle. Reading analog
@@ -100,7 +107,7 @@ Works on any badge/frontboard:
 | UP / DOWN (on I2C tile) | Toggle between the compact address list and a full-list view (when there are more addresses than fit compactly) |
 | CONFIRM (on STATUS tile) | Toggle "Remote: ON/OFF" (see below) |
 | CONFIRM (on a pin tile) | Cycle that pin's family: INSPECT (read-only) -> INPUT/LATCHED -> OUTPUT (OFF/ON/AUTO) -> LED (LS pins) or PWM (HS pins) -> back to INSPECT |
-| UP / DOWN (on a pin tile) | Within INPUT family: toggle INPUT <-> LATCHED. Within OUTPUT family: cycle OFF -> ON -> AUTO. Within LED family: brightness (OFF/ON) or breathe cycle time. F short press cycles LED OFF/ON/BREATHE |
+| UP / DOWN (on a pin tile) | Within INPUT family: toggle INPUT <-> LATCHED. Within OUTPUT family: cycle OFF -> ON -> AUTO (once in AUTO they edit the blink times: F picks high/low). Within LED family: brightness (OFF/ON) or breathe cycle time. F short press cycles LED OFF/ON/BREATHE |
 | CANCEL, short press | On the STATUS tile: hand every pin back: anything we took over is released to INPUT, then all pins return to read-only INSPECT (also clears LED and PWM settings) -- the first press only asks "Reset all pins?", press F again within 3s to confirm, any other button cancels. On a pin tile: reset that pin's LATCHED indicator (or cycle LED OFF/ON/BREATHE in an LED mode) |
 | CANCEL, held | Exit the app |
 

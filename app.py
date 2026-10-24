@@ -27,7 +27,8 @@
 #   INSPECT [<pin>]                 -- read-only snapshot, ends in END
 #   PORT [n]                        -- show / change the hexpansion port
 #   RESET                           -- hand every pin back
-#   SET <pin> IN|LATCH|OFF|ON|AUTO|INSPECT
+#   SET <pin> IN|LATCH|OFF|ON|INSPECT
+#   SET <pin> AUTO [hi_ms [lo_ms]]  -- blink with the given high / low times
 #   SET <pin> PWM [hz [duty]]       -- HS pins only
 #   SET <pin> ANALOG                -- HS pins on ports 4-6 only: read volts
 #   SET <pin> LEDOFF|LEDON [pct]    -- LS pins only (brightness)
@@ -78,7 +79,10 @@
 #                  PWM (HS) -> back to INSPECT, which releases the pin to
 #                  INPUT and stops touching it.
 #     UP/DOWN   -- within INPUT family: toggle FOLLOW <-> LATCHED.
-#                  within OUTPUT family: cycle OFF -> ON -> AUTO -> OFF.
+#                  within OUTPUT family: cycle OFF -> ON -> AUTO -> OFF
+#                  (but in AUTO, UP/DOWN edit the blink times instead --
+#                  F picks high or low, a press is 10 ms, holding for a
+#                  second speeds up; CONFIRM moves on to the next family).
 #                  within LED family: change brightness (LED OFF/ON) or
 #                  breathe cycle time (BREATHE).
 #     LS pins also have a third family, LED (the AW9523B's constant-current
@@ -118,6 +122,10 @@
 
 import app
 import os
+try:
+    from async_helpers import sleep_ms as async_sleep_ms
+except ImportError:  # not running on the badge
+    async_sleep_ms = None
 import sys
 import time
 try:
@@ -205,7 +213,7 @@ MODE_WORDS = {
     "ANALOG": PIN_MODE_ANALOG,
 }
 MODE_WORD_BY_MODE = {mode: word for word, mode in MODE_WORDS.items()}
-REMOTE_PROTOCOL = 2
+REMOTE_PROTOCOL = 3
 INPUT_FAMILY = (PIN_MODE_INPUT, PIN_MODE_LATCH)
 OUTPUT_FAMILY = (PIN_MODE_OUTPUT_OFF, PIN_MODE_OUTPUT_ON, PIN_MODE_OUTPUT_AUTO)
 LED_FAMILY = (PIN_MODE_LED_OFF, PIN_MODE_LED_ON, PIN_MODE_LED_BREATHE)
@@ -217,7 +225,12 @@ COLOR_INSPECT = (0.75, 0.75, 0.75)  # grey
 COLOR_ANALOG = (0.55, 0.85, 1.0)    # light blue
 COLOR_WARN = (1, 0.7, 0)     # hexpansion-present warning, INSPECT ONLY label
 
-BLINK_PERIOD_MS = 250  # ~2Hz full cycle
+BLINK_DEFAULT_MS = 250   # default blink high / low time (~2Hz)
+BLINK_MIN_MS = 10
+BLINK_MAX_MS = 60000
+BLINK_UI_MIN_MS = 250    # on-badge buttons stay within the range that's timed accurately
+BLINK_UI_MAX_MS = 10000
+BLINK_SERVICE_MS = 10    # how often the background task checks the blink timers
 LONG_PRESS_MS = 600
 # PWM mode: HS pins only (real ESP32 LEDC hardware PWM). The firmware
 # can't go below 10Hz (ESP_ERR_INVALID_ARG / EPERM from 8Hz down), and
@@ -269,12 +282,12 @@ class PinTesterApp(app.App):
         self.reset_armed_until = None
         self.nav_hold_dir = 0
         self.nav_hold_next = 0
+        self.hold_elapsed = 0   # how long UP/DOWN has been held, for acceleration
         self.hold_dir = 0
         self.hold_key = None
         self.hold_start = 0
         self.hold_last = 0
-        self.blink_state = False
-        self.last_blink_ms = time.ticks_ms()
+        self.frame_ms = 0   # smoothed time between update() calls
         self.last_inspect_ms = 0
         self.last_analog_ms = 0
         self.i2c_scan_result = None
@@ -339,6 +352,14 @@ class PinTesterApp(app.App):
         self.pwm_freq_idx = [PWM_DEFAULT_FREQ_IDX] * NUM_PINS
         self.pwm_duty = [PWM_DEFAULT_DUTY] * NUM_PINS
         self.pwm_field = [PWM_FIELD_FREQ] * NUM_PINS
+        # per-pin blink (OUTPUT: AUTO) timing: high / low milliseconds, when
+        # the cycle started, the level currently written, and a toggle count
+        self.blink_hi = [BLINK_DEFAULT_MS] * NUM_PINS
+        self.blink_lo = [BLINK_DEFAULT_MS] * NUM_PINS
+        self.blink_start = [0] * NUM_PINS
+        self.blink_level = [0] * NUM_PINS
+        self.blink_toggles = [0] * NUM_PINS
+        self.blink_field = [0] * NUM_PINS   # which time UP/DOWN edits: 0 = high, 1 = low
         self.adc_objs = [None] * NUM_PINS
         self.adc_mv = [None] * NUM_PINS
         self.adc_raw = [None] * NUM_PINS
@@ -511,7 +532,11 @@ class PinTesterApp(app.App):
                 pin.value(1)
             elif mode == PIN_MODE_OUTPUT_AUTO:
                 pin.init(pin.OUT)
-                pin.value(1 if self.blink_state else 0)
+                pin.value(1)  # a blink cycle starts with its high phase
+                self.blink_start[i] = time.ticks_ms()
+                self.blink_level[i] = 1
+                self.blink_toggles[i] = 0
+                self.live_levels[i] = 1
             elif mode == PIN_MODE_PWM:
                 if PIN_INFO[i][2] != "hs" or PWM is None:
                     raise ValueError("PWM mode is HS pins only")
@@ -636,6 +661,44 @@ class PinTesterApp(app.App):
         return "{}:{}".format("OUT" if info["dir"] == "out" else "IN",
                               "H" if info["level"] else "L"), info["level"]
 
+    @staticmethod
+    def _fmt_ms(ms):
+        return "{}s".format(ms / 1000) if ms >= 1000 else "{}ms".format(ms)
+
+    def _service_blink(self, i, now):
+        # Blink timing is worked out from the clock, not counted in update()
+        # frames (update() only runs about 4-5 times a second -- once per
+        # screen redraw). The phase within the high+low cycle says what the
+        # pin should be now; it's only written when that changes.
+        cycle = self.blink_hi[i] + self.blink_lo[i]
+        phase = max(0, time.ticks_diff(now, self.blink_start[i])) % cycle
+        want = 1 if phase < self.blink_hi[i] else 0
+        if want == self.blink_level[i]:
+            return
+        pin = self.pin_objs[i]
+        if pin is None:
+            return
+        try:
+            pin.value(want)
+            self.blink_level[i] = want
+            self.blink_toggles[i] += 1
+            self.live_levels[i] = want
+        except Exception as e:
+            self.status = "write error: {!r}".format(e)
+
+    async def background_task(self):
+        # Runs for every app, focused or not (see app.App.background_task):
+        # keeps blinking pins on time between screen redraws.
+        while True:
+            now = time.ticks_ms()
+            for i in range(NUM_PINS):
+                if self.pin_modes[i] == PIN_MODE_OUTPUT_AUTO:
+                    self._service_blink(i, now)
+            if async_sleep_ms is not None:
+                await async_sleep_ms(BLINK_SERVICE_MS)
+            else:
+                break
+
     def _led_breathe_duty(self, i):
         # Triangle wave 0..led_level..0 over the pin's cycle time.
         period = self.led_period[i]
@@ -696,6 +759,7 @@ class PinTesterApp(app.App):
         interval = HOLD_REPEAT_FAST_MS if held >= HOLD_ACCEL_MS else HOLD_REPEAT_MS
         if held >= HOLD_DELAY_MS and time.ticks_diff(now, self.hold_last) >= interval:
             self.hold_last = now
+            self.hold_elapsed = held
             adjust(self.hold_dir)
 
     # --- PWM mode (HS pins) ---------------------------------------------
@@ -741,10 +805,34 @@ class PinTesterApp(app.App):
             self.status = "pwm error: {!r}".format(e)
             self._apply_mode(i, PIN_MODE_INPUT, user=None)
 
+    def _blink_adjust(self, i, direction):
+        # UP/DOWN in OUTPUT: AUTO edits the selected blink time (F picks
+        # high or low). One press = 10 ms; held for a second or more the
+        # step grows to ~10% of the value so a whole range is reachable.
+        # The buttons stay within BLINK_UI_MIN_MS..BLINK_UI_MAX_MS, the
+        # range blink is timed accurately in (remote can set shorter).
+        times = self.blink_lo if self.blink_field[i] else self.blink_hi
+        cur = times[i]
+        step = 10
+        if self.hold_elapsed >= 1000:
+            step = max(50, (cur // 10) // 10 * 10)
+        new = cur + direction * step
+        if step > 10:
+            new = (new + step // 2) // step * step
+        if direction < 0:
+            if cur <= BLINK_UI_MIN_MS:
+                return   # already at / below the accurate range: don't go lower
+            new = max(BLINK_UI_MIN_MS, new)
+        else:
+            new = min(BLINK_UI_MAX_MS, new)
+        times[i] = new
+
     def _adjust_mode_value(self, i, direction):
-        # UP/DOWN auto-repeat target for the LED and PWM modes.
+        # UP/DOWN auto-repeat target for the LED, PWM and blink modes.
         if self.pin_modes[i] == PIN_MODE_PWM:
             self._pwm_adjust(i, direction)
+        elif self.pin_modes[i] == PIN_MODE_OUTPUT_AUTO:
+            self._blink_adjust(i, direction)
         else:
             self._led_adjust(i, direction)
 
@@ -789,8 +877,8 @@ class PinTesterApp(app.App):
         # digital pins, duty for LED pins, duty percent for PWM, "-" when
         # unknown). Extra key=value fields depend on the mode.
         detect = "-" if self.detect_line is None else int(self.detect_line)
-        print("DUMP port={} present={} detect={} proto={}".format(
-            self.port, int(bool(self.port_present)), detect, REMOTE_PROTOCOL))
+        print("DUMP port={} present={} detect={} proto={} frame={}".format(
+            self.port, int(bool(self.port_present)), detect, REMOTE_PROTOCOL, self.frame_ms))
         for i, (name, _s, kind, _x) in enumerate(PIN_INFO):
             mode = self.pin_modes[i]
             level = self.live_levels[i]
@@ -819,6 +907,10 @@ class PinTesterApp(app.App):
             elif mode == PIN_MODE_PWM:
                 fields.append("freq={}".format(PWM_FREQS[self.pwm_freq_idx[i]]))
                 fields.append("duty={}".format(self.pwm_duty[i]))
+            elif mode == PIN_MODE_OUTPUT_AUTO:
+                fields.append("hi={}".format(self.blink_hi[i]))
+                fields.append("lo={}".format(self.blink_lo[i]))
+                fields.append("tog={}".format(self.blink_toggles[i]))
             elif mode == PIN_MODE_ANALOG:
                 if self.adc_mv[i] is not None:
                     fields.append("mv={}".format(self.adc_mv[i]))
@@ -888,7 +980,8 @@ class PinTesterApp(app.App):
         #   INSPECT [<pin>]         -- fresh read-only snapshot, ends in END
         #   PORT [n]                -- show / change the hexpansion port
         #   RESET                   -- hand every pin back (like STATUS F)
-        #   SET <pin> IN|LATCH|OFF|ON|AUTO|INSPECT
+        #   SET <pin> IN|LATCH|OFF|ON|INSPECT
+        #   SET <pin> AUTO [hi_ms [lo_ms]]          (blink; default 250 / 250)
         #   SET <pin> PWM [hz [duty]]               (HS pins)
         #   SET <pin> ANALOG                        (HS pins on ports 4-6, ADC)
         #   SET <pin> LEDOFF|LEDON [pct]            (LS pins, brightness)
@@ -966,6 +1059,11 @@ class PinTesterApp(app.App):
                                 range(len(PWM_FREQS)), key=lambda k: abs(PWM_FREQS[k] - n))
                             if len(parts) >= 5:
                                 self.pwm_duty[i] = max(0, min(100, int(parts[4])))
+                        elif mode_word == "AUTO":
+                            # n = high ms, optional 5th field = low ms
+                            self.blink_hi[i] = max(BLINK_MIN_MS, min(BLINK_MAX_MS, n))
+                            self.blink_lo[i] = (max(BLINK_MIN_MS, min(BLINK_MAX_MS, int(parts[4])))
+                                                if len(parts) >= 5 else self.blink_hi[i])
                         elif mode_word == "BREATHE":
                             self.led_period[i] = max(LED_PERIOD_MIN_MS, min(
                                 LED_PERIOD_MAX_MS, n * 100))
@@ -976,6 +1074,8 @@ class PinTesterApp(app.App):
                         self._pwm_push(i)  # already running: update in place
                     elif self.pin_modes[i] == target and target in LED_FAMILY:
                         self.pin_user_set[i] = True  # values are read live
+                    elif self.pin_modes[i] == target and target == PIN_MODE_OUTPUT_AUTO:
+                        self.pin_user_set[i] = True  # new timings apply to the running blink
                     else:
                         self._apply_mode(i, target)
                     print("OK {} {}".format(parts[1], mode_word))
@@ -985,6 +1085,7 @@ class PinTesterApp(app.App):
             print("ERR {!r}".format(e))
 
     def update(self, delta):
+        self.frame_ms = delta if not self.frame_ms else (self.frame_ms * 4 + delta) // 5
         if self.remote_active:
             self._poll_remote_commands()
 
@@ -1040,6 +1141,8 @@ class PinTesterApp(app.App):
                         self.reset_armed_until = time.ticks_add(now, RESET_CONFIRM_MS)
                 elif 0 <= self.nav < NUM_PINS and self.pin_modes[self.nav] == PIN_MODE_PWM:
                     self.pwm_field[self.nav] = 1 - self.pwm_field[self.nav]
+                elif 0 <= self.nav < NUM_PINS and self.pin_modes[self.nav] == PIN_MODE_OUTPUT_AUTO:
+                    self.blink_field[self.nav] = 1 - self.blink_field[self.nav]
                 elif 0 <= self.nav < NUM_PINS and self.pin_modes[self.nav] in LED_FAMILY:
                     self._cycle_led_mode(self.nav)
                 else:
@@ -1126,6 +1229,7 @@ class PinTesterApp(app.App):
                     self._apply_mode(i, PIN_MODE_INSPECT)
             elif up_pressed or down_pressed:
                 direction = 1 if up_pressed else -1
+                self.hold_elapsed = 0   # a fresh press: smallest step
                 if self.pin_modes[i] in (PIN_MODE_INSPECT, PIN_MODE_ANALOG):
                     pass  # read-only: nothing to change
                 elif self.pin_modes[i] in INPUT_FAMILY:
@@ -1135,10 +1239,12 @@ class PinTesterApp(app.App):
                     self._led_adjust(i, direction)
                 elif self.pin_modes[i] == PIN_MODE_PWM:
                     self._pwm_adjust(i, direction)
+                elif self.pin_modes[i] == PIN_MODE_OUTPUT_AUTO:
+                    self._blink_adjust(i, direction)
                 else:
                     idx = OUTPUT_FAMILY.index(self.pin_modes[i])
                     self._apply_mode(i, OUTPUT_FAMILY[(idx + direction) % len(OUTPUT_FAMILY)])
-            if self.pin_modes[i] in LED_FAMILY or self.pin_modes[i] == PIN_MODE_PWM:
+            if self.pin_modes[i] in LED_FAMILY or self.pin_modes[i] in (PIN_MODE_PWM, PIN_MODE_OUTPUT_AUTO):
                 self._hold_repeat(i, up_pressed, down_pressed, lambda d: self._adjust_mode_value(i, d))
             else:
                 self.hold_dir = 0
@@ -1157,10 +1263,6 @@ class PinTesterApp(app.App):
         # blinking, and a latch keep watching, while you look at something
         # else entirely (including the STATUS overview).
         now = time.ticks_ms()
-        blink_tick = time.ticks_diff(now, self.last_blink_ms) >= BLINK_PERIOD_MS
-        if blink_tick:
-            self.last_blink_ms = now
-            self.blink_state = not self.blink_state
 
         if (PIN_MODE_INSPECT in self.pin_modes
                 and time.ticks_diff(now, self.last_inspect_ms) >= INSPECT_POLL_MS):
@@ -1207,15 +1309,9 @@ class PinTesterApp(app.App):
                         self.live_levels[i] = duty
                     except Exception as e:
                         self.status = "write error: {!r}".format(e)
-            elif mode == PIN_MODE_OUTPUT_AUTO and blink_tick:
-                pin = self._ensure_pin(i)
-                if pin is None:
-                    continue
-                try:
-                    pin.value(1 if self.blink_state else 0)
-                    self.live_levels[i] = 1 if self.blink_state else 0
-                except Exception as e:
-                    self.status = "write error: {!r}".format(e)
+            elif mode == PIN_MODE_OUTPUT_AUTO:
+                if self._ensure_pin(i) is not None:
+                    self._service_blink(i, now)  # also serviced by background_task()
 
         return True
 
@@ -1356,6 +1452,8 @@ class PinTesterApp(app.App):
             return "U/D:val F:mode C:swap"
         if mode == PIN_MODE_PWM:
             return "U/D:val F:field C:swap"
+        if mode == PIN_MODE_OUTPUT_AUTO:
+            return "U/D:time F:field C:swap"
         return "U/D:mode C:swap"
 
     def draw(self, ctx):
@@ -1526,8 +1624,14 @@ class PinTesterApp(app.App):
                              ("raw = {} / 65535".format(raw), "", None, (0.8, 0.8, 0.8)),
                              (chan_text, "", None, (0.6, 0.6, 0.6))]
             elif mode == PIN_MODE_OUTPUT_AUTO:
-                lines = [("blinking @2Hz", "", None, colour),
-                         ("status = ", onoff_text, level, colour)]
+                lines = []
+                for n, (label, ms) in enumerate((("high", self.blink_hi[i]), ("low", self.blink_lo[i]))):
+                    active = n == self.blink_field[i]
+                    text = "{} {} = {}".format(">" if active else " ", label, self._fmt_ms(ms))
+                    if ms < BLINK_UI_MIN_MS:
+                        text += " (rough)"   # shorter than the accurate range (set remotely)
+                    lines.append((text, "", None, (1, 1, 0.3) if active else (0.8, 0.8, 0.8)))
+                lines.append(("status = ", onoff_text, level, colour))
             else:
                 lines = [("status = ", onoff_text, level, colour)]
             self._draw_value_lines(ctx, lines, VALUE_LINES_TOP)
